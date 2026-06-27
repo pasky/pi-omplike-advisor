@@ -448,6 +448,25 @@ test("runTurnBlock: terminal timeout → delivers held best-effort (current, not
 	assert.deepEqual(delivered, [{ note: "x", severity: "concern" }]);
 });
 
+test("runTurnBlock: passes { terminal } through to deliverHeld (settled + timeout paths)", async () => {
+	// The flag drives whether deliverHeld appends the self-contained-final-answer
+	// guidance, so it must be wired through both delivery sites.
+	const calls = [];
+	const record = (notes, opts) => calls.push({ notes, opts });
+
+	// terminal + settled → { terminal: true }
+	await A.runTurnBlock(blockArgs({ terminal: true, runtime: stubRuntime({ held: [{ note: "a" }], settleResult: "settled" }), deliverHeld: record }));
+	// non-terminal + settled → { terminal: false }
+	await A.runTurnBlock(blockArgs({ terminal: false, runtime: stubRuntime({ held: [{ note: "b" }], settleResult: "settled" }), deliverHeld: record }));
+	// terminal + timeout (best-effort) → { terminal: true }
+	await A.runTurnBlock(blockArgs({ terminal: true, runtime: stubRuntime({ held: [{ note: "c" }], settleResult: "timeout" }), deliverHeld: record }));
+
+	assert.equal(calls.length, 3);
+	assert.equal(calls[0].opts?.terminal, true, "terminal settled → terminal:true");
+	assert.equal(calls[1].opts?.terminal, false, "non-terminal settled → terminal:false");
+	assert.equal(calls[2].opts?.terminal, true, "terminal timeout best-effort → terminal:true");
+});
+
 test("runTurnBlock: aborted (user Escape) → keeps held + streak, no delivery", async () => {
 	const delivered = [];
 	const rt = stubRuntime({ held: [{ note: "x", severity: "blocker" }], settleResult: "aborted" });

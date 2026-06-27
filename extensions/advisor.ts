@@ -956,11 +956,12 @@ export default function (pi: ExtensionAPI) {
 	// the user just stopped. Cleared when the user drives the next turn.
 	let autoResumeSuppressed = false;
 
-	// Whether the turn currently being reviewed/blocked-on is terminal (the agent
-	// already returned a final answer). When true, advice we steer in will wake the
-	// stopped agent for a follow-up turn, so we tell it to reply with a fresh,
-	// self-contained final answer rather than a back-and-forth the user must stitch
-	// together. Updated every turn_end.
+	// Whether the primary is currently stopped, having returned a final answer (the
+	// most recent turn was terminal and the user hasn't driven a new one yet). When
+	// true, advice we steer in wakes the stopped agent for a follow-up turn, so we
+	// tell it to reply with a fresh, self-contained final answer rather than a
+	// back-and-forth the user must stitch together. Set at turn_end (before any
+	// await, since late nit callbacks read it) and cleared at before_agent_start.
 	let currentTurnTerminal = false;
 
 	// ---- advice delivery into the primary session ----
@@ -1102,6 +1103,10 @@ export default function (pi: ExtensionAPI) {
 		if (!enabled) return;
 		// The user is driving a new turn; clear any post-abort auto-resume suppression.
 		autoResumeSuppressed = false;
+		// The agent is now working, not stopped — drop any leftover terminal flag so a
+		// late nit from an earlier still-draining review can't wrongly claim the user
+		// already has a final answer. (Re-set accurately at this turn's turn_end.)
+		currentTurnTerminal = false;
 		pendingUserPrompt = event.prompt;
 	});
 
@@ -1112,15 +1117,20 @@ export default function (pi: ExtensionAPI) {
 		// Test seam: skip live model review (keeps the /advisor test delivery path) so
 		// nit delivery can be tested in the pi harness without the advisor model.
 		if (!enabled || process.env.ADVISOR_NO_REVIEW) return;
+
+		// Record terminality BEFORE any await: a nit from an EARLIER, still-draining
+		// review can fire its deliverAdvice callback during the ensureRuntime() await
+		// below, and it reads this flag — so it must already reflect the just-ended
+		// turn. Semantics: "the primary is now stopped, having returned a final answer"
+		// (set true on a terminal turn, false otherwise; cleared when the user drives a
+		// new turn). Used so advice that wakes the stopped agent appends the
+		// self-contained-final-answer guidance.
+		const terminal = isTerminalTurn(event.message as any);
+		currentTurnTerminal = terminal;
+
 		const rt = await ensureRuntime(ctx as any);
 		dbg("turn_end", "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
 		if (!rt) return;
-
-		// Record terminality up front so advice delivered during THIS turn's review/
-		// catch-up block (nits via deliverAdvice, survivors via deliverHeld) can append
-		// the self-contained-final-answer guidance when it would wake a stopped agent.
-		const terminal = isTerminalTurn(event.message as any);
-		currentTurnTerminal = terminal;
 
 		const delta = formatTurnDelta({
 			userPrompt: pendingUserPrompt,
