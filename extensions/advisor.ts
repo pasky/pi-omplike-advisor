@@ -278,11 +278,13 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 // Caveat: there is NO input-budget backpressure here, and the advisor does not
 // self-compact (AdvisorRuntime.reset is triggered by the PRIMARY's compaction, not
 // by the advisor's own context filling). On a very long/large session its
-// accumulated context can overflow; today that just fails the review — fail-safe
-// (it drops the batch / goes silent rather than emitting false advice), not a
-// crash. Proper input budgeting (chunking / advisor self-reset on overflow) is a
-// known follow-up; truncation was the wrong tool for it — it corrupted every
-// normal review to avert a rare case.
+// accumulated context can overflow; today that just fails the review (no crash).
+// Mostly fail-safe: a mid-run failed review goes silent. The one exception is a
+// TERMINAL turn, which by design delivers already-held high-severity notes
+// best-effort (last chance before idle, see runTurnBlock) — so an overflow there
+// could ship a stale held note. Proper input budgeting (chunking / advisor
+// self-reset on overflow) is a known follow-up; truncation was the wrong tool for
+// it — it corrupted every normal review to avert a rare case.
 function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
@@ -297,14 +299,15 @@ export function formatTurnDelta(opts: {
 	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${opts.userPrompt.trim()}`);
 
 	// Correlate calls → results by toolCallId so an edit's raw args can be suppressed
-	// in favor of the result's diff — but ONLY when that diff actually exists. A failed
-	// edit (no diff) keeps its attempted {oldText,newText} so the advisor can still
-	// diagnose the match failure. Name-agnostic: any call whose result carries a diff.
+	// in favor of the result's diff — but ONLY when a SUCCESSFUL diff exists. A failed
+	// edit (no diff, or an error result whose diff is untrustworthy) keeps its attempted
+	// {oldText,newText} so the advisor can still diagnose the failure. Name-agnostic:
+	// any non-error call whose result carries a diff.
 	const diffByCallId = new Map<string, string>();
 	for (const tr of opts.toolResults ?? []) {
 		const id = (tr as { toolCallId?: string }).toolCallId;
 		const d = (tr as { details?: { diff?: unknown } }).details?.diff;
-		if (id && typeof d === "string" && d.trim()) diffByCallId.set(id, d);
+		if (id && !tr.isError && typeof d === "string" && d.trim()) diffByCallId.set(id, d);
 	}
 
 	const a = opts.assistant;
@@ -343,14 +346,16 @@ export function formatTurnDelta(opts: {
 
 	for (const tr of opts.toolResults ?? []) {
 		// Prefer the canonical line-numbered unified diff (the same view the human /
-		// main model gets, computed by pi's edit-diff) when the tool produced one: its
-		// -/+ markers unambiguously frame removed-vs-current lines, which the flat
+		// main model gets, computed by pi's edit-diff) for a SUCCESSFUL result: its -/+
+		// markers unambiguously frame removed-vs-current lines, which the flat
 		// {oldText,newText} echo lacks. It is also a pinned point-in-time snapshot of
 		// THIS turn's change — the advisor's own read returns current (possibly later-
 		// edited) disk, so the inline diff is not re-derivable and must ride verbatim.
+		// On an ERROR, show the text body instead: the error is the diagnostic, and a
+		// diff from a failed edit is untrustworthy (did it apply? partially?).
 		const diff = (tr as { details?: { diff?: unknown } }).details?.diff;
 		const body =
-			typeof diff === "string" && diff.trim()
+			!tr.isError && typeof diff === "string" && diff.trim()
 				? diff
 				: textOf(tr.content as Array<{ type: string; text?: string }>);
 		parts.push(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);

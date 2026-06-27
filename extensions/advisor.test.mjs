@@ -229,6 +229,36 @@ test("formatTurnDelta: a failed edit (no diff) keeps its attempted args for diag
 	assert.ok(md.includes("`edit` (error)"), "the error is still shown");
 });
 
+test("formatTurnDelta: an ERROR result with a diff keeps args + error text (untrusted diff dropped)", () => {
+	const md = A.formatTurnDelta({
+		assistant: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "7", name: "multiedit", arguments: { path: "g.py", edits: [{ oldText: "attempted needle", newText: "z" }] } },
+			],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+		// a custom/hooked edit tool that errored but still carried a diff
+		toolResults: [
+			{
+				role: "toolResult",
+				toolCallId: "7",
+				toolName: "multiedit",
+				content: [{ type: "text", text: "Error: partial apply rejected" }],
+				details: { diff: "- 1 old\n+ 1 new" },
+				isError: true,
+				timestamp: 2,
+			},
+		],
+	});
+	assert.ok(md.includes("attempted needle"), "args kept on error even when a diff exists");
+	assert.ok(md.includes("Error: partial apply rejected"), "error text shown, not replaced by the diff");
+	assert.ok(!md.includes("+ 1 new"), "untrustworthy error-result diff is not shown");
+	assert.ok(!md.includes("diff in tool result"), "no suppression header on an error result");
+});
+
 test("formatTurnDelta: feeds large content verbatim (no truncation, no markers)", () => {
 	const big = "LINE\n".repeat(5000); // ~25KB, well past every old clamp
 	const md = A.formatTurnDelta({
