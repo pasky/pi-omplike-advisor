@@ -75,6 +75,13 @@ adding an `advisor` entry to `modes.json` (project `.pi/modes.json` or global
 If the configured model can't be resolved, the advisor falls back to the current
 session model.
 
+### System prompt
+
+The advisor ships with a built-in default system prompt (a string constant in
+`extensions/advisor.ts`). To override it, drop your own
+`~/.pi/agent/system-prompts/advisor.md` — if present, it replaces the bundled
+default wholesale.
+
 ### Project guidance (`WATCHDOG.md`)
 
 If a `WATCHDOG.md` file exists in the working directory, its contents are
