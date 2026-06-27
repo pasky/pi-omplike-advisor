@@ -180,7 +180,7 @@ export function formatReconfirmPreamble(held: readonly AdvisorNote[]): string {
 		"### Held advisories — reconfirm",
 		"",
 		"You raised these on an earlier step; they were held pending reconfirmation, because by now the agent may have already addressed them. Re-check each against the latest activity below.",
-		"For every item that STILL applies, call `advise` again — same severity, or higher if it's gotten worse; never lower it. Say nothing for the rest — silence drops them.",
+		"For every item that STILL applies, call `advise` again — same severity, or higher if it's gotten worse; never lower it. Say nothing for the rest — silence drops them. Do NOT call `advise` to announce that an item is resolved or that all are cleared; just stay silent.",
 		"",
 		items,
 		"",
@@ -207,7 +207,7 @@ export class AdviseTool {
 	readonly name = "advise";
 	readonly label = "Advise";
 	readonly description =
-		"Send one concrete, terse piece of advice to the agent you are watching. Use sparingly; stay silent when nothing matters. Call it to head off likely-wrong or materially wasteful work.";
+		"Send one concrete, ACTIONABLE piece of advice to the agent you are watching. Use sparingly; stay silent when nothing matters. Call it to head off likely-wrong or materially wasteful work. NEVER call it to report status, acknowledge, confirm, summarize, or signal that all is well / resolved / nothing-further-needed — in those cases emit nothing.";
 	readonly parameters = adviseSchema as any;
 	#delivered = new Map<string, number>();
 
