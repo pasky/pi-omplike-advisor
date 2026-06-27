@@ -810,6 +810,114 @@ test("runtime.waitUntilSettled: an ACCUMULATED-context overflow self-compacts an
 	assert.equal(rt.hasHeld, false, "a successful (post-compaction) review still prunes recanted holds");
 });
 
+test("runtime: a concern/blocker held by a DISCARDED overflowed attempt is rolled back, not kept (finding #1)", async () => {
+	// Attempt 1 holds a blocker, then overflows (stopReason length). The reactive
+	// self-compaction must roll that hold back: it was raised against a truncated
+	// view, and offeredKeys (snapshotted pre-attempt) can't prune it. The fresh
+	// replay re-raises only what still applies; here it stays silent, so the
+	// phantom blocker must NOT survive (else it'd later deliver as if confirmed).
+	let attempts = 0;
+	let rt;
+	const agent = {
+		state: { messages: [], model: {} },
+		async prompt() {
+			attempts++;
+			if (attempts === 1) {
+				rt.hold("phantom blocker from overflowed attempt", "blocker"); // mid-attempt hold
+				this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "length" });
+			} else {
+				this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "stop" }); // silent fresh replay
+			}
+		},
+		abort() {},
+		reset() {
+			this.state.messages = [];
+		},
+	};
+	rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0);
+	rt.push("turn");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+	assert.equal(attempts, 2, "overflow then a successful fresh replay");
+	assert.equal(rt.hasHeld, false, "the phantom blocker from the discarded attempt was rolled back");
+});
+
+test("runtime: the reactive rollback keeps PRE-EXISTING held notes, dropping only the discarded attempt's adds (finding #1)", async () => {
+	let attempts = 0;
+	let rt;
+	const agent = {
+		state: { messages: [], model: {} },
+		async prompt() {
+			attempts++;
+			if (attempts === 1) rt.hold("phantom from overflowed attempt", "blocker"); // only the first attempt adds it
+			this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "length" }); // always overflows ⇒ failed, no prune
+		},
+		abort() {},
+		reset() {
+			this.state.messages = [];
+		},
+	};
+	rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0);
+	rt.hold("real prior blocker", "blocker"); // pre-existing, captured in the pre-batch snapshot
+	rt.push("turn");
+	assert.equal(await rt.waitUntilSettled(2000), "failed");
+	const held = rt.takeHeld();
+	assert.equal(held.length, 1, "exactly the pre-existing held note remains");
+	assert.equal(held[0].note, "real prior blocker", "phantom dropped by rollback, prior kept");
+});
+
+test("runtime: PROACTIVE self-compaction fires at ADVISOR_COMPACT_AT, replays fresh, and preserves lifetime cost accounting", async () => {
+	const promptMsgCounts = [];
+	let resets = 0;
+	const agent = {
+		state: {
+			// One prior turn whose usage puts the advisor at 90% of a 100k window.
+			messages: [{ role: "assistant", content: [], usage: { input: 90000, cost: { total: 0.5 } }, stopReason: "stop" }],
+			model: { contextWindow: 100000 },
+		},
+		async prompt() {
+			promptMsgCounts.push(this.state.messages.length); // 0 ⇒ replayed into a fresh context
+			this.state.messages.push({ role: "assistant", content: [], usage: { input: 5, cost: { total: 0.01 } }, stopReason: "stop" });
+		},
+		abort() {},
+		reset() {
+			resets++;
+			this.state.messages = [];
+		},
+	};
+	const rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0); // default compactAt = 80
+	rt.push("turn");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+	assert.equal(resets, 1, "proactive self-compaction reset the agent before the review");
+	assert.equal(promptMsgCounts[0], 0, "the batch was replayed into a fresh (cleared) context");
+	const u = rt.usage;
+	assert.equal(u.input, 90005, "lifetime input survives the self-compaction (folded 90000 + fresh 5)");
+	assert.ok(Math.abs(u.cost - 0.51) < 1e-9, "lifetime cost survives the self-compaction (0.5 + 0.01)");
+	assert.equal(u.contextTokens, 5, "context size reflects only the fresh post-compaction turn");
+});
+
+test("runtime: PROACTIVE self-compaction respects a custom compactAtPercent threshold (no reset below it)", async () => {
+	let resets = 0;
+	const agent = {
+		state: {
+			messages: [{ role: "assistant", content: [], usage: { input: 60000 }, stopReason: "stop" }], // 60% of 100k
+			model: { contextWindow: 100000 },
+		},
+		async prompt() {
+			this.state.messages.push({ role: "assistant", content: [], usage: { input: 5 }, stopReason: "stop" });
+		},
+		abort() {},
+		reset() {
+			resets++;
+			this.state.messages = [];
+		},
+	};
+	// Threshold 95 > 60% current ⇒ must NOT compact.
+	const rt = new A.AdvisorRuntime(agent, new A.AdviseTool(() => false), 0, undefined, 95);
+	rt.push("turn");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+	assert.equal(resets, 0, "context below the configured threshold is left intact");
+});
+
 test("runtime.acceptingAdvice: an in-flight review orphaned by reset() stops accepting advice", async () => {
 	let during;
 	let afterReset;

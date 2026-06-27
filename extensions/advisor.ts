@@ -421,6 +421,14 @@ export class AdvisorRuntime {
 	#backlog = 0;
 	#failures = 0;
 	#epoch = 0;
+	// Lifetime input/output/cost from advisor turns already discarded by a
+	// self-compaction (#softReset). The agent's message list only holds the CURRENT
+	// (post-compaction) context, so without folding these in, /advisor status would
+	// undercount lifetime tokens/cost after each self-compaction. A full reset()
+	// (primary compaction / new session) zeroes them — that is a fresh accounting.
+	#cumInput = 0;
+	#cumOutput = 0;
+	#cumCost = 0;
 	disposed = false;
 
 	// Self-compact when the advisor's own context reaches this % of its window
@@ -448,6 +456,16 @@ export class AdvisorRuntime {
 	 * epoch (the in-flight review is ours, not orphaned) nor drop queued/held work.
 	 */
 	#softReset(): void {
+		// Preserve lifetime token/cost accounting before the about-to-be-cleared
+		// messages are gone (see #cumInput/#cumOutput/#cumCost).
+		for (const m of this.agent.state.messages) {
+			if (m.role === "assistant" && (m as AssistantMessage).usage) {
+				const u = (m as AssistantMessage).usage;
+				this.#cumInput += u.input ?? 0;
+				this.#cumOutput += u.output ?? 0;
+				this.#cumCost += u.cost?.total ?? 0;
+			}
+		}
 		try {
 			this.agent.abort();
 		} catch {}
@@ -566,9 +584,9 @@ export class AdvisorRuntime {
 	}
 
 	get usage(): { input: number; output: number; cost: number; contextTokens: number; contextPercent: number | null } {
-		let input = 0;
-		let output = 0;
-		let cost = 0;
+		let input = this.#cumInput;
+		let output = this.#cumOutput;
+		let cost = this.#cumCost;
 		let contextTokens = 0;
 		for (const m of this.agent.state.messages) {
 			if (m.role === "assistant" && (m as AssistantMessage).usage) {
@@ -602,6 +620,8 @@ export class AdvisorRuntime {
 		this.#lastOutcome = undefined;
 		this.#backlog = 0;
 		this.#failures = 0;
+		// Full reset = fresh accounting (unlike #softReset, which preserves these).
+		this.#cumInput = this.#cumOutput = this.#cumCost = 0;
 		this.adviseTool.resetDelivered();
 		try {
 			this.agent.abort();
@@ -682,6 +702,16 @@ export class AdvisorRuntime {
 						if (last?.stopReason === "length" && attempt === 0) {
 							this.onDebug?.("advisor context overflow, self-compacting (reactive) and replaying batch fresh");
 							this.#softReset();
+							// Roll back any concern/blocker the DISCARDED overflowed attempt held:
+							// it was raised against a truncated view, and offeredKeys was snapshotted
+							// pre-attempt so the success-prune below can't reach it — left in place
+							// it would later deliver (e.g. terminal best-effort) as if confirmed.
+							// The fresh replay re-raises it if genuine; otherwise it's correctly
+							// gone. Exact: #held only GROWS during an attempt (hold() never removes),
+							// so restoring the pre-batch snapshot drops exactly the attempt's adds.
+							// (Nits were already steered + recorded in #delivered, which survives
+							// softReset, so the replay dedupes them — no double-fire.)
+							this.#held = offered.slice();
 							this.#reraised = new Set();
 							continue;
 						}
