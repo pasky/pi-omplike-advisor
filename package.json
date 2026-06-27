@@ -1,0 +1,41 @@
+{
+  "name": "pi-omplike-advisor",
+  "version": "1.0.0",
+  "description": "Pi extension: a persistent second model that reviews the main agent's work each turn and injects concise advice inline.",
+  "license": "MIT",
+  "author": "Petr Baudis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pasky/pi-omplike-advisor.git"
+  },
+  "homepage": "https://github.com/pasky/pi-omplike-advisor#readme",
+  "bugs": "https://github.com/pasky/pi-omplike-advisor/issues",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "advisor",
+    "review"
+  ],
+  "files": [
+    "extensions/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/advisor.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@mariozechner/pi-tui": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
