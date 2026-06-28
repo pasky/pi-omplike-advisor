@@ -38,7 +38,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Agent, type AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, TextContent, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -301,14 +301,53 @@ function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
 
-/** Format one primary turn (optionally preceded by the user prompt) as markdown. */
+function safeJson(v: unknown): string {
+	try {
+		return JSON.stringify(v);
+	} catch {
+		return "<unserializable>";
+	}
+}
+
+// Render tool-call arguments as readable text with REAL newlines preserved.
+// CRITICAL: never JSON.stringify a whole multiline argument — that escapes every
+// real newline into a literal backslash-n, so the advisor sees `<<'EOF'\n...`
+// and can't tell a heredoc body's genuine newlines from escapes (this exact bug
+// produced a bogus "garbled markdown" advisory). String values ride verbatim; the
+// `edits` array (failed/untrusted edits, which aren't suppressed in favor of a
+// diff) shows each attempted old/new block raw so a diagnosis stays possible.
+function renderToolArgs(args: Record<string, unknown> | undefined): string {
+	if (!args || typeof args !== "object") return "";
+	const lines: string[] = [];
+	for (const [k, v] of Object.entries(args)) {
+		if (typeof v === "string") {
+			lines.push(v.includes("\n") ? `${k}:\n${v}` : `${k}: ${v}`);
+		} else if (k === "edits" && Array.isArray(v)) {
+			v.forEach((e, i) => {
+				const o = (e as { oldText?: unknown })?.oldText;
+				const n = (e as { newText?: unknown })?.newText;
+				const fmt = (x: unknown) => (typeof x === "string" ? x : safeJson(x));
+				lines.push(`edit ${i + 1} oldText:\n${fmt(o)}`);
+				lines.push(`edit ${i + 1} newText:\n${fmt(n)}`);
+			});
+		} else {
+			lines.push(`${k}: ${safeJson(v)}`);
+		}
+	}
+	return lines.join("\n");
+}
+
+// Format one primary turn (optionally preceded by the user prompt) as an array of
+// text content blocks. Returning blocks (not one pre-escaped markdown string) lets
+// each piece ride verbatim as a JSON string on the wire — see buildReviewMessages.
 export function formatTurnDelta(opts: {
 	userPrompt?: string;
 	assistant?: AssistantMessage;
 	toolResults?: ToolResultMessage[];
-}): string {
-	const parts: string[] = [];
-	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${opts.userPrompt.trim()}`);
+}): TextContent[] {
+	const blocks: TextContent[] = [];
+	const block = (text: string) => blocks.push({ type: "text", text });
+	if (opts.userPrompt?.trim()) block(`#### User\n\n${opts.userPrompt.trim()}`);
 
 	// Correlate calls → results by toolCallId so an edit's raw args can be suppressed
 	// in favor of the result's diff — but ONLY when a SUCCESSFUL diff exists. A failed
@@ -343,17 +382,12 @@ export function formatTurnDelta(opts: {
 					const p = (c.arguments as { path?: string }).path ?? "?";
 					sub.push(`→ tool \`${c.name}\`(${p}) — ${edits.length} block(s); diff in tool result`);
 				} else {
-					let args: string;
-					try {
-						args = JSON.stringify(c.arguments);
-					} catch {
-						args = "<unserializable>";
-					}
-					sub.push(`→ tool \`${c.name}\`(${args})`);
+					const argsText = renderToolArgs(c.arguments as Record<string, unknown> | undefined);
+					sub.push(argsText ? `→ tool \`${c.name}\`:\n${argsText}` : `→ tool \`${c.name}\``);
 				}
 			}
 		}
-		if (sub.length) parts.push(`#### Assistant\n\n${sub.join("\n\n")}`);
+		if (sub.length) block(`#### Assistant\n\n${sub.join("\n\n")}`);
 	}
 
 	for (const tr of opts.toolResults ?? []) {
@@ -370,9 +404,27 @@ export function formatTurnDelta(opts: {
 			!tr.isError && typeof diff === "string" && diff.trim()
 				? diff
 				: textOf(tr.content as Array<{ type: string; text?: string }>);
-		parts.push(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);
+		block(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);
 	}
-	return parts.join("\n\n");
+	return blocks;
+}
+
+// Assemble a review prompt as a BATCH of user messages: a header/reconfirm turn,
+// then one user turn per primary-turn delta. On OpenAI-family endpoints (e.g.
+// OpenRouter) consecutive user turns stay distinct; on Anthropic-family endpoints
+// they fold into one turn (≈newline-join, per the Anthropic Messages API: "Consecutive
+// user or assistant turns ... will be combined into a single turn"). Either way each
+// delta's content blocks ride verbatim as JSON strings — no \n-escaping, no fences —
+// which is the entire point versus the old JSON.stringify'd markdown blob.
+export function buildReviewMessages(preamble: string, batch: TextContent[][]): UserMessage[] {
+	const now = Date.now();
+	const messages: UserMessage[] = [
+		{ role: "user", content: [{ type: "text", text: `### Session update\n\n${preamble}`.trimEnd() }], timestamp: now },
+	];
+	for (const deltaBlocks of batch) {
+		if (deltaBlocks.length) messages.push({ role: "user", content: deltaBlocks, timestamp: now });
+	}
+	return messages;
 }
 
 // ---- build the persistent advisor Agent ----
@@ -411,7 +463,7 @@ function buildAdvisorAgent(opts: {
  * own context so the next delta replays fresh.
  */
 export class AdvisorRuntime {
-	#pending: string[] = [];
+	#pending: TextContent[][] = [];
 	#held: AdvisorNote[] = [];
 	// Keys re-raised during the in-flight review; drives the post-review prune.
 	#reraised: Set<string> | undefined;
@@ -610,10 +662,13 @@ export class AdvisorRuntime {
 		return { input, output, cost, contextTokens, contextPercent };
 	}
 
-	/** Queue a rendered primary-turn delta for review. */
-	push(deltaText: string): void {
-		if (this.disposed || !deltaText.trim()) return;
-		this.#pending.push(deltaText);
+	/** Queue a rendered primary-turn delta (content blocks) for review. Accepts a
+	 *  plain string too (wrapped into a single text block) for convenience/tests. */
+	push(delta: TextContent[] | string): void {
+		const blocks: TextContent[] =
+			typeof delta === "string" ? (delta.trim() ? [{ type: "text", text: delta }] : []) : delta;
+		if (this.disposed || blocks.length === 0) return;
+		this.#pending.push(blocks);
 		this.#backlog++;
 		void this.#drain();
 	}
@@ -674,7 +729,18 @@ export class AdvisorRuntime {
 				const preamble = formatReconfirmPreamble(offered);
 				this.#reraised = new Set();
 				this.#reviewEpoch = epoch;
-				const prompt = batch.join("\n\n---\n\n");
+				const messages = buildReviewMessages(preamble, batch);
+				const promptChars = messages.reduce(
+					(n, m) =>
+						n +
+						(Array.isArray(m.content)
+							? m.content.reduce(
+									(k: number, b: { type: string; text?: string }) => k + (b.type === "text" ? (b.text?.length ?? 0) : 0),
+									0,
+								)
+							: 0),
+					0,
+				);
 				// A review "fails" either by throwing OR — the common case — by resolving
 				// with an assistant message whose stopReason is "error"/"aborted" (the agent
 				// loop records provider failures that way instead of throwing). A failed
@@ -699,8 +765,8 @@ export class AdvisorRuntime {
 					// doesn't fit, so it falls through to the failed handling below.
 					let last: AssistantMessage | undefined;
 					for (let attempt = 0; attempt < 2; attempt++) {
-						this.onDebug?.("prompting advisor agent, delta chars=", prompt.length, "held=", offered.length);
-						await this.agent.prompt(`### Session update\n\n${preamble}${prompt}`);
+						this.onDebug?.("prompting advisor agent, delta chars=", promptChars, "held=", offered.length);
+						await this.agent.prompt(messages);
 						if (this.#epoch !== epoch) {
 							stale = true;
 							break; // reset/dispose during the prompt; batch is stale

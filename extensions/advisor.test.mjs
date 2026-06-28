@@ -56,6 +56,10 @@ const ALIAS = {
 const jiti = createJiti(import.meta.url, { moduleCache: false, alias: ALIAS });
 const A = await jiti.import(resolve(HERE, "advisor.ts"));
 
+// formatTurnDelta now returns TextContent[]; join the blocks the way the wire
+// would present them (verbatim) so the existing substring assertions still apply.
+const renderDelta = (o) => A.formatTurnDelta(o).map((b) => b.text).join("\n\n");
+
 initTheme();
 
 let passed = 0;
@@ -150,7 +154,7 @@ test("formatAdvisoryContent: finalAnswer appends self-contained-final-answer gui
 });
 
 test("formatTurnDelta: includes user, thinking, text, tool call + result", () => {
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		userPrompt: "do the thing",
 		assistant: {
 			role: "assistant",
@@ -168,13 +172,28 @@ test("formatTurnDelta: includes user, thinking, text, tool call + result", () =>
 	assert.match(md, /#### User\n\ndo the thing/);
 	assert.match(md, /<thinking>\nlet me think\n<\/thinking>/);
 	assert.match(md, /here is my plan/);
-	assert.match(md, /→ tool `write`\(\{"path":"a\.js"\}\)/);
+	assert.match(md, /→ tool `write`:\npath: a\.js/);
 	assert.match(md, /#### Tool result: `write`\n\nwrote a\.js/);
+});
+
+test("formatTurnDelta: a multi-line bash command rides verbatim (no \\n escaping)", () => {
+	const cmd = "cat > /tmp/x <<'EOF'\nline one\nline two\nEOF";
+	const md = renderDelta({
+		assistant: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "1", name: "bash", arguments: { command: cmd } }],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+	});
+	assert.ok(md.includes(cmd), "command preserved verbatim with REAL newlines");
+	assert.ok(!md.includes("\\n"), "no literal backslash-n escapes (the bug this fixes)");
 });
 
 test("formatTurnDelta: edits render as compact header + result diff (no raw old/new blobs)", () => {
 	const diff = "  10 unchanged\n- 11 bootstrap 0/0\n+ 11 bootstrap 0.045% (9/20000)\n  12 unchanged";
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		assistant: {
 			role: "assistant",
 			content: [
@@ -218,7 +237,7 @@ test("formatTurnDelta: edits render as compact header + result diff (no raw old/
 });
 
 test("formatTurnDelta: a failed edit (no diff) keeps its attempted args for diagnosis", () => {
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		assistant: {
 			role: "assistant",
 			content: [
@@ -238,8 +257,26 @@ test("formatTurnDelta: a failed edit (no diff) keeps its attempted args for diag
 	assert.ok(md.includes("`edit` (error)"), "the error is still shown");
 });
 
+test("formatTurnDelta: a multi-line failed edit preserves real newlines in old/new", () => {
+	const oldText = "def foo():\n    return 1";
+	const md = renderDelta({
+		assistant: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "9", name: "edit", arguments: { path: "f.py", edits: [{ oldText, newText: "def foo():\n    return 2" }] } },
+			],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+		toolResults: [{ role: "toolResult", toolCallId: "9", toolName: "edit", content: [{ type: "text", text: "Error: not found" }], isError: true, timestamp: 2 }],
+	});
+	assert.ok(md.includes(oldText), "multi-line oldText preserved verbatim");
+	assert.ok(!md.includes("def foo():\\n"), "no \\n escaping in failed-edit args");
+});
+
 test("formatTurnDelta: an ERROR result with a diff keeps args + error text (untrusted diff dropped)", () => {
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		assistant: {
 			role: "assistant",
 			content: [
@@ -270,7 +307,7 @@ test("formatTurnDelta: an ERROR result with a diff keeps args + error text (untr
 
 test("formatTurnDelta: feeds large content verbatim (no truncation, no markers)", () => {
 	const big = "LINE\n".repeat(5000); // ~25KB, well past every old clamp
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		userPrompt: big,
 		assistant: {
 			role: "assistant",
@@ -286,14 +323,25 @@ test("formatTurnDelta: feeds large content verbatim (no truncation, no markers)"
 });
 
 test("formatTurnDelta: marks tool errors", () => {
-	const md = A.formatTurnDelta({
+	const md = renderDelta({
 		toolResults: [{ role: "toolResult", toolCallId: "1", toolName: "bash", content: [{ type: "text", text: "boom" }], isError: true, timestamp: 2 }],
 	});
 	assert.match(md, /#### Tool result: `bash` \(error\)/);
 });
 
-test("formatTurnDelta: empty turn ⇒ empty string", () => {
-	assert.equal(A.formatTurnDelta({}), "");
+test("formatTurnDelta: empty turn ⇒ no blocks", () => {
+	assert.deepEqual(A.formatTurnDelta({}), []);
+});
+
+test("buildReviewMessages: header turn + one user turn per delta, content verbatim", () => {
+	const d1 = A.formatTurnDelta({
+		assistant: { role: "assistant", content: [{ type: "toolCall", id: "1", name: "bash", arguments: { command: "echo hi\nls" } }], usage: {}, stopReason: "toolUse", timestamp: 1 },
+	});
+	const msgs = A.buildReviewMessages("", [d1]);
+	assert.equal(msgs.length, 2, "header turn + one delta turn");
+	assert.ok(msgs.every((m) => m.role === "user"), "all user turns");
+	assert.match(msgs[0].content[0].text, /### Session update/);
+	assert.ok(msgs[1].content.some((b) => b.text.includes("echo hi\nls")), "command rides verbatim in its content block");
 });
 
 test("AdviseTool: records, dedups, and escalates by severity rank", async () => {
@@ -515,11 +563,20 @@ function buildIntegration({ onReview } = {}) {
 	});
 	const agent = {
 		state: { messages: [], model: {} },
-		async prompt(text) {
+		async prompt(input) {
 			// Defer like a real (multi-second, network) advisor review: the hold must
 			// land AFTER push()/turn_end returns, not synchronously inside it.
 			await new Promise((r) => setTimeout(r, 0));
 			reviewCount++;
+			// prompt() now receives a batch of user messages (TextContent[] content);
+			// flatten to the verbatim wire text the model would see so onReview can
+			// assert on it (e.g. the reconfirm preamble).
+			const text =
+				typeof input === "string"
+					? input
+					: input
+							.map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text ?? "").join("\n") : m.content))
+							.join("\n\n");
 			await onReview?.(text, { tool, rt, reviewCount });
 			this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "stop" });
 		},
