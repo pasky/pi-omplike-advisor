@@ -301,40 +301,35 @@ function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
 
-function safeJson(v: unknown): string {
-	try {
-		return JSON.stringify(v);
-	} catch {
-		return "<unserializable>";
+// Render any tool-call argument value as readable text with REAL newlines preserved
+// at EVERY depth. We never JSON.stringify content: that escapes every real newline
+// into a literal backslash-n (so a heredoc body reaches the advisor as `<<'EOF'\n...`
+// — the exact bug that produced a bogus "garbled markdown" advisory), and escaping
+// only at the top level merely pushes the bug into nested strings (e.g. edits[].oldText).
+// String leaves ride verbatim; containers are walked. Tool args are plain JSON data
+// from the model, so there are no cycles or non-serializable leaves to guard against;
+// a depth cap is the only (never-hit-in-practice) backstop.
+function renderArgValue(v: unknown, indent: string, depth: number): string {
+	// Multiline strings ride raw on following lines — NOT re-indented, which would
+	// alter the very content (e.g. a heredoc body) the advisor must see verbatim.
+	if (typeof v === "string") return v.includes("\n") ? `\n${v}` : ` ${v}`;
+	if (v === null || typeof v !== "object") return ` ${String(v)}`;
+	if (depth >= 8) return " […]";
+	const childIndent = `${indent}  `;
+	if (Array.isArray(v)) {
+		if (v.length === 0) return " []";
+		return v.map((e, i) => `\n${indent}- [${i}]${renderArgValue(e, childIndent, depth + 1)}`).join("");
 	}
+	const entries = Object.entries(v as Record<string, unknown>);
+	if (entries.length === 0) return " {}";
+	return entries.map(([k, val]) => `\n${indent}${k}:${renderArgValue(val, childIndent, depth + 1)}`).join("");
 }
 
-// Render tool-call arguments as readable text with REAL newlines preserved.
-// CRITICAL: never JSON.stringify a whole multiline argument — that escapes every
-// real newline into a literal backslash-n, so the advisor sees `<<'EOF'\n...`
-// and can't tell a heredoc body's genuine newlines from escapes (this exact bug
-// produced a bogus "garbled markdown" advisory). String values ride verbatim; the
-// `edits` array (failed/untrusted edits, which aren't suppressed in favor of a
-// diff) shows each attempted old/new block raw so a diagnosis stays possible.
 function renderToolArgs(args: Record<string, unknown> | undefined): string {
 	if (!args || typeof args !== "object") return "";
-	const lines: string[] = [];
-	for (const [k, v] of Object.entries(args)) {
-		if (typeof v === "string") {
-			lines.push(v.includes("\n") ? `${k}:\n${v}` : `${k}: ${v}`);
-		} else if (k === "edits" && Array.isArray(v)) {
-			v.forEach((e, i) => {
-				const o = (e as { oldText?: unknown })?.oldText;
-				const n = (e as { newText?: unknown })?.newText;
-				const fmt = (x: unknown) => (typeof x === "string" ? x : safeJson(x));
-				lines.push(`edit ${i + 1} oldText:\n${fmt(o)}`);
-				lines.push(`edit ${i + 1} newText:\n${fmt(n)}`);
-			});
-		} else {
-			lines.push(`${k}: ${safeJson(v)}`);
-		}
-	}
-	return lines.join("\n");
+	const entries = Object.entries(args);
+	if (entries.length === 0) return "";
+	return entries.map(([k, v]) => `${k}:${renderArgValue(v, "  ", 0)}`).join("\n");
 }
 
 // Format one primary turn (optionally preceded by the user prompt) as an array of

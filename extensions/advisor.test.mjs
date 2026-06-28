@@ -275,6 +275,24 @@ test("formatTurnDelta: a multi-line failed edit preserves real newlines in old/n
 	assert.ok(!md.includes("def foo():\\n"), "no \\n escaping in failed-edit args");
 });
 
+test("formatTurnDelta: a multi-line string NESTED in a non-edits container survives verbatim", () => {
+	// Locks the general principle behind dropping safeJson: newlines are preserved at
+	// EVERY depth, not just for top-level string args or the special-cased `edits`.
+	const script = "#!/bin/sh\nset -e\nrun foo";
+	const md = renderDelta({
+		assistant: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "1", name: "custom", arguments: { spec: { script, retries: 3 } } }],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+	});
+	assert.ok(md.includes(script), "nested multi-line string rides verbatim (no JSON.stringify escaping)");
+	assert.ok(!md.includes("set -e\\n"), "no \\n escaping at depth");
+	assert.ok(md.includes("retries: 3"), "scalar siblings still rendered");
+});
+
 test("formatTurnDelta: an ERROR result with a diff keeps args + error text (untrusted diff dropped)", () => {
 	const md = renderDelta({
 		assistant: {
