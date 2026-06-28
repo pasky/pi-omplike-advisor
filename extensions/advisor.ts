@@ -842,8 +842,9 @@ export class AdvisorRuntime {
 
 const ADVISORY_TYPE = "advisory";
 // Footer status key. Statuses are ordered alphabetically by key; "q-advisor"
-// sorts after "permissions"/"modes" but before "sub-bar", so Advisor shows as the
-// second segment. Change this to reposition it (e.g. "a-advisor" for leftmost).
+// sorts after "permissions"/"provider-system-prompt" but before "sub-bar", so
+// Advisor shows as a middle segment. Change this to reposition it (e.g.
+// "a-advisor" for leftmost).
 const STATUS_KEY = "q-advisor";
 const DEBUG = !!process.env.ADVISOR_DEBUG;
 const dbg = (...a: unknown[]) => {
@@ -1029,13 +1030,17 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
-	// bar as `│ Advisor: $N │`. Cleared when the advisor is off or torn down.
+	// bar as `│ Advisor: $N`. Cleared when the advisor is off or torn down.
 	//
 	// Footer ordering: pi sorts extension statuses alphabetically BY KEY and joins
 	// them with a single space (no separators of its own). So the key controls
-	// position and we draw our own `│` dividers in the text. STATUS_KEY sorts after
-	// "permissions"/"modes" but before "sub-bar" (p < q < s), placing Advisor as the
-	// second segment rather than the leftmost.
+	// position and we draw our own `│` divider in the text. STATUS_KEY sorts after
+	// "permissions"/"provider-system-prompt" but before "sub-bar", placing Advisor as
+	// a middle segment rather than the leftmost.
+	//
+	// LEADING bar only (no trailing): whatever follows draws its own separator
+	// (e.g. pi-sub-bar with statusLeadingDivider:true starts with `│`), so a trailing
+	// bar here would double up (`│ Advisor │ │ …`).
 	function updateStatus(ctx: unknown): void {
 		const ui = (ctx as {
 			ui?: { setStatus?: (k: string, t: string | undefined) => void; theme?: { fg: (c: string, s: string) => string } };
@@ -1046,7 +1051,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const bar = ui.theme ? ui.theme.fg("dim", "│") : "│";
-		ui.setStatus(STATUS_KEY, `${bar} Advisor: $${runtime.usage.cost.toFixed(2)} ${bar}`);
+		ui.setStatus(STATUS_KEY, `${bar} Advisor: $${runtime.usage.cost.toFixed(2)}`);
 	}
 
 	// ---- advice delivery into the primary session ----
