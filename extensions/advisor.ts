@@ -44,7 +44,7 @@ import { convertToLlm, createReadOnlyTools } from "@earendil-works/pi-coding-age
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { resolveModelAndThinking } from "./lib/mode-utils.js";
+import { loadModeSpec, resolveModelAndThinking } from "./lib/mode-utils.js";
 
 // ===========================================================================
 // Advisor core — persistent second model that watches the main agent.
@@ -1153,14 +1153,15 @@ export default function (pi: ExtensionAPI) {
 		let model: any;
 		let thinkingLevel = DEFAULT_THINKING;
 		try {
-			const resolved = await resolveModelAndThinking(ctx.cwd, ctx.modelRegistry, ctx.model, DEFAULT_THINKING, {
-				mode: "advisor",
-			});
-			// resolveModelAndThinking falls back to the current model when "advisor"
-			// mode is absent; detect that and use our hard default instead.
-			const sameAsPrimary = resolved.model === ctx.model;
-			model = sameAsPrimary ? undefined : resolved.model;
-			thinkingLevel = resolved.thinkingLevel || DEFAULT_THINKING;
+			const spec = await loadModeSpec(ctx.cwd, "advisor");
+			if (spec) {
+				// Mode was configured — resolve it explicitly even if same as primary.
+				const resolved = await resolveModelAndThinking(ctx.cwd, ctx.modelRegistry, ctx.model, DEFAULT_THINKING, {
+					mode: "advisor",
+				});
+				model = resolved.model;
+				thinkingLevel = resolved.thinkingLevel || DEFAULT_THINKING;
+			}
 		} catch {}
 		if (!model) {
 			model = ctx.modelRegistry.find(DEFAULT_ADVISOR_PROVIDER, DEFAULT_ADVISOR_MODEL);
