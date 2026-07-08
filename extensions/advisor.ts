@@ -293,24 +293,6 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 	return `${body}\n\nYou had already returned a final answer to the user this turn. If you act on the advice above, respond with a new, self-contained final answer that fully stands on its own — do NOT write a terse follow-up that assumes the user read your previous message. The user should be able to read your new reply alone and get the complete answer.`;
 }
 
-/**
- * Content flags for an inline nit delivery, derived from a single truth: whether
- * the steer lands as a followup to a terminal message (the primary is parked at /
- * settling on a final answer) or joins an in-flight turn.
- *
- * - terminal followup → advice ON the answer just given: NOT stale, and it should
- *   prompt a fresh self-contained restate (finalAnswer).
- * - mid-run           → the agent has already moved past the reviewed step: stale,
- *   and there is no final answer to restate yet.
- *
- * The two are strict opposites; keeping them in one helper stops the delivery path
- * from hardcoding `stale: true` (which mislabelled terminal-followup nits as "about
- * an earlier step") or gating restate on a flag that is dead on that path.
- */
-export function inlineAdvisoryFlags(terminalFollowup: boolean): { stale: boolean; finalAnswer: boolean } {
-	return { stale: !terminalFollowup, finalAnswer: terminalFollowup };
-}
-
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
 
 // No truncation of the delta. The advisor is a peer reviewer (its own model, its
@@ -1068,26 +1050,6 @@ export default function (pi: ExtensionAPI) {
 	// await, since late nit callbacks read it) and cleared at before_agent_start.
 	let currentTurnTerminal = false;
 
-	// Latest event ctx, captured so delivery callbacks (which fire from an in-flight
-	// or lagging review, outside their own handler) can query LIVE primary state.
-	// isIdle() === !isStreaming, so it's true only once the primary has actually
-	// parked (never during an in-block review), which is exactly when a late nit
-	// steered with triggerTurn wakes the agent as a followup to its final answer.
-	let lastCtx: { isIdle?: () => boolean } | undefined;
-	const primaryIdle = (): boolean => {
-		try {
-			return !!lastCtx?.isIdle?.();
-		} catch {
-			return false;
-		}
-	};
-	// A delivery is a followup to a terminal message when the reviewed turn is the
-	// terminal one (currentTurnTerminal is true across the in-block terminal wait) OR
-	// the primary has already parked (a lagging review waking an idle agent). Either
-	// way the steer becomes a new turn on top of a final answer, independent of when
-	// the note was generated.
-	const terminalFollowup = (): boolean => currentTurnTerminal || primaryIdle();
-
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
 	// bar as `│ Advisor: $N`. Cleared when the advisor is off or torn down.
@@ -1170,15 +1132,12 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 
-		// nit: deliver now. The stale/restate framing is computed from delivery-time
-		// state (inlineAdvisoryFlags(terminalFollowup())): a nit waking a parked agent
-		// is a followup to its final answer (restate, not "earlier step"), while one
-		// joining an in-flight turn is about a step already moved past (stale, no
-		// restate). triggerTurn wakes an idle agent — unless the user just aborted
-		// (Escape), in which case we must not auto-resume the run they stopped.
+		// nit: deliver now, tagged as raised about an earlier step. triggerTurn wakes
+		// an idle agent — unless the user just aborted (Escape), in which case we must
+		// not auto-resume the run they stopped.
 		dbg("deliverAdvice nit", JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
-		const content = formatAdvisoryContent(notes, inlineAdvisoryFlags(terminalFollowup()));
+		const content = formatAdvisoryContent(notes, { stale: true, finalAnswer: currentTurnTerminal });
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 		return true;
 	}
@@ -1187,18 +1146,19 @@ export default function (pi: ExtensionAPI) {
 	function deliverHeld(notes: AdvisorNote[], opts?: { terminal?: boolean }): void {
 		if (handoffInProgress() || !notes.length) return;
 		// The self-contained-final-answer guidance is gated on whether this delivery is
-		// a followup to a terminal message (terminalFollowup(): the reviewed turn is the
-		// terminal one, or the primary has already parked), not on which turn generated
-		// the note. A note held from an earlier turn still restates iff it lands on a
-		// terminal-followup primary. opts.terminal — the turn that triggered this block —
-		// must agree with currentTurnTerminal at every call site (runTurnBlock runs inside
-		// turn_end, which sets the flag before calling it); log if a future out-of-band
-		// caller ever diverges.
+		// a followup to a terminal message — i.e. the primary is stopped at a final
+		// answer RIGHT NOW (the live currentTurnTerminal flag), not on which turn
+		// generated the note. A note held from an earlier turn still restates iff it
+		// lands on a stopped/terminal primary. opts.terminal — the turn that triggered
+		// this block — must equal currentTurnTerminal at every call site (runTurnBlock
+		// runs inside turn_end, which sets the flag before calling it); we key off the
+		// live flag so generation-time is out of the decision by construction, and
+		// assert the invariant so a future out-of-band caller can't silently diverge.
 		if (opts && opts.terminal !== undefined && opts.terminal !== currentTurnTerminal)
 			dbg("deliverHeld: opts.terminal diverged from live currentTurnTerminal", opts.terminal, currentTurnTerminal);
 		for (const n of notes) {
 			dbg("deliverHeld", n.severity, JSON.stringify(n.note).slice(0, 120));
-			const content = formatAdvisoryContent([n], { finalAnswer: terminalFollowup() });
+			const content = formatAdvisoryContent([n], { finalAnswer: currentTurnTerminal });
 			pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes: [n] } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 			// Record at the real delivery point (onAdvice→false never recorded it), so a
 			// later same-or-lower-severity repeat is deduped.
@@ -1216,7 +1176,6 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		currentTurnTerminal = false;
-		lastCtx = undefined;
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
@@ -1229,7 +1188,6 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		currentTurnTerminal = false;
-		lastCtx = undefined;
 	}
 
 	// ---- build the advisor agent lazily (needs ctx for model/registry/cwd) ----
@@ -1311,10 +1269,6 @@ export default function (pi: ExtensionAPI) {
 		// self-contained-final-answer guidance.
 		const terminal = isTerminalTurn(event.message as any);
 		currentTurnTerminal = terminal;
-		// Keep a live handle so delivery callbacks can query primaryIdle(), used by a
-		// lagging review that fires after the agent has parked. isIdle() delegates to the
-		// session, so an earlier turn's ctx still reports current streaming state.
-		lastCtx = ctx as any;
 
 		const rt = await ensureRuntime(ctx as any);
 		dbg("turn_end", "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
@@ -1442,9 +1396,6 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("usage: /advisor test <nit|concern|blocker> <note>", "warning");
 					return;
 				}
-				// Query live primary state so an idle agent (command run at rest) is treated
-				// as a terminal followup, matching the real review-driven delivery path.
-				lastCtx = ctx as any;
 				deliverAdvice(parsed.note, parsed.severity);
 				return;
 			}
