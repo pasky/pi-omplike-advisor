@@ -159,6 +159,37 @@ test("formatAdvisoryContent: finalAnswer appends self-contained-final-answer gui
 	assert.doesNotMatch(A.formatAdvisoryContent([{ note: "fix bug", severity: "blocker" }]), /self-contained final answer/);
 });
 
+test("decideNit: concern/blocker always held", () => {
+	assert.equal(A.decideNit("concern", false, false), "hold");
+	assert.equal(A.decideNit("concern", true, true), "hold");
+	assert.equal(A.decideNit("blocker", false, true), "hold");
+});
+
+test("decideNit: a nit is held only when parked at a terminal turn with a review in flight", () => {
+	// terminal + advisor busy (review in flight) → hold, so it rides the terminal catch-up
+	assert.equal(A.decideNit("nit", true, false), "hold");
+	assert.equal(A.decideNit(undefined, true, false), "hold");
+	// terminal but advisor idle (e.g. /advisor test hook, no review) → deliver inline as a
+	// followup to the final answer: about an earlier step (stale) AND restate.
+	assert.deepEqual(A.decideNit("nit", true, true), { stale: true, finalAnswer: true });
+	// mid-run (non-terminal) → deliver inline: earlier/superseded step, no final answer yet.
+	assert.deepEqual(A.decideNit("nit", false, false), { stale: true, finalAnswer: false });
+	assert.deepEqual(A.decideNit("nit", false, true), { stale: true, finalAnswer: false });
+});
+
+test("decideNit: delivered flags feed formatAdvisoryContent consistently", () => {
+	const followup = A.decideNit("nit", true, true); // terminal followup via idle advisor
+	assert.notEqual(followup, "hold");
+	const c = A.formatAdvisoryContent([{ note: "n", severity: "nit" }], followup);
+	assert.match(c, /context="raised about an earlier step"/, "inline nit is always about an earlier step");
+	assert.match(c, /self-contained final answer/, "a terminal-followup inline nit restates");
+
+	const midrun = A.decideNit("nit", false, false);
+	const m = A.formatAdvisoryContent([{ note: "n", severity: "nit" }], midrun);
+	assert.match(m, /context="raised about an earlier step"/);
+	assert.doesNotMatch(m, /self-contained final answer/, "a mid-run inline nit has no final answer to restate");
+});
+
 test("formatTurnDelta: includes user, thinking, text, tool call + result", () => {
 	const md = renderDelta({
 		userPrompt: "do the thing",
@@ -606,20 +637,17 @@ function buildIntegration({ onReview } = {}) {
 	// way turn_end sets it before running the catch-up block).
 	const state = { terminal: false };
 	const tool = new A.AdviseTool((note, severity) => {
-		// mirrors deliverAdvice: drop stale (orphaned review), hold high severity,
-		// hold any nit raised while stopped at a terminal turn, treat a nit matching
-		// a held note as a reconfirmation (held, not recorded), else deliver the nit.
+		// mirrors deliverAdvice but shares the hold/flags decision with the real code
+		// via A.decideNit (so this can't silently drift): drop orphaned advice, then
+		// hold or deliver per decideNit, with reconfirm-a-held-note checked inline.
 		if (rt && !rt.acceptingAdvice) return true;
-		if (A.isHighSeverity(severity)) {
-			rt.hold(note, severity);
-			return false;
-		}
-		if (state.terminal && !rt.idle) {
+		const decision = A.decideNit(severity, state.terminal, rt ? rt.idle : true);
+		if (decision === "hold") {
 			rt.hold(note, severity);
 			return false;
 		}
 		if (rt.reconfirmIfHeld(note)) return false;
-		delivered.push({ note, severity, kind: "nit" });
+		delivered.push({ note, severity, kind: "nit", stale: decision.stale, finalAnswer: decision.finalAnswer });
 		return true;
 	});
 	const agent = {

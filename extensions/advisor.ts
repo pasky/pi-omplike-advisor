@@ -293,6 +293,33 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 	return `${body}\n\nYou had already returned a final answer to the user this turn. If you act on the advice above, respond with a new, self-contained final answer that fully stands on its own — do NOT write a terse follow-up that assumes the user read your previous message. The user should be able to read your new reply alone and get the complete answer.`;
 }
 
+/** "hold this nit for reconfirmation" or "deliver it inline with these content flags". */
+export type NitDecision = "hold" | { stale: boolean; finalAnswer: boolean };
+
+/**
+ * The core nit-delivery decision, factored out so the live deliverAdvice path and
+ * the integration tests share ONE source of truth instead of the tests mirroring
+ * a private copy that silently drifts (which is exactly why the delivery flags
+ * went untested). It intentionally excludes the stateful reconfirm-a-held-note
+ * check (runtime.reconfirmIfHeld mutates) — that stays inline between this hold
+ * decision and the actual send.
+ *
+ * - concern/blocker → always held (reconfirmed against unraced state later).
+ * - nit while the primary is parked at a terminal answer with a review still in
+ *   flight → held, so it rides the terminal catch-up and is delivered with the
+ *   restate directive rather than steering mid-review.
+ * - otherwise deliver inline. Such a nit is always about an earlier/superseded
+ *   step (a *current* nit from the terminal review is held by the branch above),
+ *   hence `stale: true`; it carries the restate directive only when it is itself
+ *   a followup to a final answer (`currentTurnTerminal`, reachable with an idle
+ *   advisor, e.g. the `/advisor test` hook).
+ */
+export function decideNit(severity: AdvisorSeverity | undefined, currentTurnTerminal: boolean, advisorIdle: boolean): NitDecision {
+	if (isHighSeverity(severity)) return "hold";
+	if (currentTurnTerminal && !advisorIdle) return "hold";
+	return { stale: true, finalAnswer: currentTurnTerminal };
+}
+
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
 
 // No truncation of the delta. The advisor is a peer reviewer (its own model, its
@@ -1096,27 +1123,17 @@ export default function (pi: ExtensionAPI) {
 			return true;
 		}
 
-		if (isHighSeverity(severity)) {
-			// Always held: the advisor is seconds behind, so any high-severity advice
-			// is about a state the agent has likely moved past. Reconfirm + the catch-up
-			// block deliver it (against unraced state) only if it still applies.
-			dbg("deliverAdvice hold", severity, JSON.stringify(note).slice(0, 120));
+		// Hold-vs-deliver decision, shared with the integration tests via decideNit so
+		// the two can't drift. advisorIdle defaults to true when there's no runtime,
+		// matching the original gate `currentTurnTerminal && runtime && !runtime.idle`.
+		// Rationale (see decideNit): concern/blocker always held; a nit is held once the
+		// primary is parked at a terminal turn with a review still in flight so it rides
+		// the terminal catch-up (delivered with the restate directive) rather than
+		// steering mid-review; otherwise it's an earlier-step nit delivered inline.
+		const decision = decideNit(severity, currentTurnTerminal, runtime ? runtime.idle : true);
+		if (decision === "hold") {
+			dbg(isHighSeverity(severity) ? "deliverAdvice hold" : "deliverAdvice hold (terminal-turn nit)", severity, JSON.stringify(note).slice(0, 120));
 			runtime?.hold(note, severity);
-			return false;
-		}
-
-		// Once the primary has stopped at a terminal turn, hold nits too instead of
-		// steering them mid-review. Advise callbacks only fire while a review is in
-		// flight (!idle), and any such review either LAGS the final turn — its nit is
-		// about a PREVIOUS turn's state the final turn may have addressed, so it must
-		// survive the final review's reconfirm preamble (this also covers the window
-		// where turn_end has set the flag but not yet pushed the final delta, when
-		// #pending can't tell the review is lagging) — or IS the final turn's review,
-		// whose nit is current and simply waits for settle: it skips the prune (it
-		// wasn't in the offered snapshot) and the terminal catch-up block delivers it.
-		if (currentTurnTerminal && runtime && !runtime.idle) {
-			dbg("deliverAdvice hold (terminal-turn nit)", JSON.stringify(note).slice(0, 120));
-			runtime.hold(note, severity);
 			return false;
 		}
 
@@ -1132,16 +1149,16 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 
-		// nit: deliver now, tagged as raised about an earlier step. triggerTurn wakes
-		// an idle agent — unless the user just aborted (Escape), in which case we must
-		// not auto-resume the run they stopped.
+		// nit: deliver inline with the flags decideNit computed. triggerTurn wakes an
+		// idle agent — unless the user just aborted (Escape), in which case we must not
+		// auto-resume the run they stopped.
 		// Log why this went inline rather than held: it reaches here only when the
-		// terminal-hold gate above was false, so currentTurnTerminal (and the advisor's
-		// idle state) pinpoint whether it's a genuine mid-run/lagging nit or a gate
-		// timing anomaly (agent parked at a final answer but currentTurnTerminal false).
+		// terminal-hold gate was false, so currentTurnTerminal (and the advisor's idle
+		// state) pinpoint whether it's a genuine mid-run/lagging nit or a gate timing
+		// anomaly (agent parked at a final answer but currentTurnTerminal false).
 		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", runtime?.idle, JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
-		const content = formatAdvisoryContent(notes, { stale: true, finalAnswer: currentTurnTerminal });
+		const content = formatAdvisoryContent(notes, decision);
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 		return true;
 	}
@@ -1254,6 +1271,20 @@ export default function (pi: ExtensionAPI) {
 		// already has a final answer. (Re-set accurately at this turn's turn_end.)
 		currentTurnTerminal = false;
 		pendingUserPrompt = event.prompt;
+	});
+
+	// before_agent_start fires ONLY for the user-message path (agent-session.ts
+	// emits it inside prompt()). A turn woken by our own steered advisory with
+	// triggerTurn goes straight through _runAgentPrompt and never emits it, so the
+	// reset above would be skipped and currentTurnTerminal would stay stale-true
+	// across the advisory-triggered turn (until its first turn_end). agent_start is
+	// emitted from the agent's own event stream for EVERY run, so mirror the
+	// terminal-flag reset here: once any run begins, the agent is working, not
+	// parked at a final answer. (pendingUserPrompt/autoResumeSuppressed stay tied to
+	// before_agent_start — those are genuinely user-turn-only.)
+	pi.on("agent_start", () => {
+		if (!enabled) return;
+		currentTurnTerminal = false;
 	});
 
 	// One delta per primary turn (assistant message + its tool results). After
