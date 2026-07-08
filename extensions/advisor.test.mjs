@@ -159,6 +159,25 @@ test("formatAdvisoryContent: finalAnswer appends self-contained-final-answer gui
 	assert.doesNotMatch(A.formatAdvisoryContent([{ note: "fix bug", severity: "blocker" }]), /self-contained final answer/);
 });
 
+test("inlineAdvisoryFlags: terminal followup restates and is NOT stale; mid-run is stale and does not restate", () => {
+	// A nit that lands as a followup to a terminal message is advice ON the answer
+	// just given: not "about an earlier step", and it should prompt a restate.
+	assert.deepEqual(A.inlineAdvisoryFlags(true), { stale: false, finalAnswer: true });
+	// A nit that joins an in-flight turn: the agent moved past the reviewed step
+	// (stale) and there is no final answer to restate yet.
+	assert.deepEqual(A.inlineAdvisoryFlags(false), { stale: true, finalAnswer: false });
+});
+
+test("inlineAdvisoryFlags + formatAdvisoryContent: terminal followup renders restate without the earlier-step tag", () => {
+	const followup = A.formatAdvisoryContent([{ note: "n", severity: "nit" }], A.inlineAdvisoryFlags(true));
+	assert.doesNotMatch(followup, /context="raised about an earlier step"/, "terminal followup must not be mislabelled as an earlier step");
+	assert.match(followup, /self-contained final answer/, "terminal followup must prompt a restate");
+
+	const midrun = A.formatAdvisoryContent([{ note: "n", severity: "nit" }], A.inlineAdvisoryFlags(false));
+	assert.match(midrun, /context="raised about an earlier step"/, "mid-run nit is about an earlier step");
+	assert.doesNotMatch(midrun, /self-contained final answer/, "mid-run nit has no final answer to restate");
+});
+
 test("formatTurnDelta: includes user, thinking, text, tool call + result", () => {
 	const md = renderDelta({
 		userPrompt: "do the thing",
