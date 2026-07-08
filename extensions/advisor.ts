@@ -1135,7 +1135,11 @@ export default function (pi: ExtensionAPI) {
 		// nit: deliver now, tagged as raised about an earlier step. triggerTurn wakes
 		// an idle agent — unless the user just aborted (Escape), in which case we must
 		// not auto-resume the run they stopped.
-		dbg("deliverAdvice nit", JSON.stringify(note).slice(0, 120));
+		// Log why this went inline rather than held: it reaches here only when the
+		// terminal-hold gate above was false, so currentTurnTerminal (and the advisor's
+		// idle state) pinpoint whether it's a genuine mid-run/lagging nit or a gate
+		// timing anomaly (agent parked at a final answer but currentTurnTerminal false).
+		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", runtime?.idle, JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
 		const content = formatAdvisoryContent(notes, { stale: true, finalAnswer: currentTurnTerminal });
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
@@ -1271,7 +1275,7 @@ export default function (pi: ExtensionAPI) {
 		currentTurnTerminal = terminal;
 
 		const rt = await ensureRuntime(ctx as any);
-		dbg("turn_end", "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
+		dbg("turn_end", "terminal=", terminal, "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
 		if (!rt) return;
 
 		const delta = formatTurnDelta({
