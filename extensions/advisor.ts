@@ -310,14 +310,22 @@ export type NitDecision = "hold" | { stale: boolean; finalAnswer: boolean };
  *   restate directive rather than steering mid-review.
  * - otherwise deliver inline. Such a nit is always about an earlier/superseded
  *   step (a *current* nit from the terminal review is held by the branch above),
- *   hence `stale: true`; it carries the restate directive only when it is itself
- *   a followup to a final answer (`currentTurnTerminal`, reachable with an idle
- *   advisor, e.g. the `/advisor test` hook).
+ *   hence `stale: true`; it carries the restate directive when it is a followup to
+ *   a final answer, either because the turn currently ending is terminal
+ *   (`currentTurnTerminal`, e.g. the terminal catch-up or the `/advisor test` hook)
+ *   OR the primary is already parked at a final answer (`parkedAtFinalAnswer`, the
+ *   case a lagging review hits when it fires seconds after the agent went idle;
+ *   currentTurnTerminal races false there, which is the bug this parameter fixes).
  */
-export function decideNit(severity: AdvisorSeverity | undefined, currentTurnTerminal: boolean, advisorIdle: boolean): NitDecision {
+export function decideNit(
+	severity: AdvisorSeverity | undefined,
+	currentTurnTerminal: boolean,
+	advisorIdle: boolean,
+	parkedAtFinalAnswer = false,
+): NitDecision {
 	if (isHighSeverity(severity)) return "hold";
 	if (currentTurnTerminal && !advisorIdle) return "hold";
-	return { stale: true, finalAnswer: currentTurnTerminal };
+	return { stale: true, finalAnswer: currentTurnTerminal || parkedAtFinalAnswer };
 }
 
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
@@ -1077,6 +1085,29 @@ export default function (pi: ExtensionAPI) {
 	// await, since late nit callbacks read it) and cleared at before_agent_start.
 	let currentTurnTerminal = false;
 
+	// Terminality of the last COMPLETED turn, set at every turn_end and NEVER reset
+	// on turn_start/before_agent_start. Unlike currentTurnTerminal (cleared the moment
+	// a new turn begins), this survives so that when the primary is idle it
+	// authoritatively answers "is the agent parked at a final answer?", the reliable
+	// signal a lagging review needs when it delivers a nit seconds after the agent
+	// parked (a window in which currentTurnTerminal alone races false).
+	let lastTurnWasTerminal = false;
+
+	// Latest event ctx, captured so a delivery callback firing from a lagging review
+	// (outside its own handler) can query LIVE primary state. isIdle() === !isStreaming.
+	let lastCtx: { isIdle?: () => boolean } | undefined;
+	const primaryIdle = (): boolean => {
+		try {
+			return !!lastCtx?.isIdle?.();
+		} catch {
+			return false;
+		}
+	};
+	// Authoritative "the steer lands as a followup to a final answer": primary parked
+	// (idle) AND its last completed turn was terminal. Robust to abort/mid-tool idle
+	// (last turn non-terminal makes this false) unlike a bare isIdle() check.
+	const parkedAtFinalAnswer = (): boolean => primaryIdle() && lastTurnWasTerminal;
+
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
 	// bar as `│ Advisor: $N`. Cleared when the advisor is off or torn down.
@@ -1131,7 +1162,11 @@ export default function (pi: ExtensionAPI) {
 		// the terminal catch-up (delivered with the restate directive) rather than
 		// steering mid-review; otherwise it's an earlier-step nit delivered inline.
 		const advisorIdle = runtime ? runtime.idle : true;
-		const decision = decideNit(severity, currentTurnTerminal, advisorIdle);
+		// parkedAtFinalAnswer catches the lagging-review case: the nit fires seconds
+		// after the agent went idle at a final answer, so it must restate even though
+		// currentTurnTerminal has raced false by then.
+		const parked = parkedAtFinalAnswer();
+		const decision = decideNit(severity, currentTurnTerminal, advisorIdle, parked);
 		if (decision === "hold") {
 			dbg(isHighSeverity(severity) ? "deliverAdvice hold" : "deliverAdvice hold (terminal-turn nit)", severity, JSON.stringify(note).slice(0, 120));
 			runtime?.hold(note, severity);
@@ -1157,7 +1192,7 @@ export default function (pi: ExtensionAPI) {
 		// terminal-hold gate was false, so currentTurnTerminal (and the advisor's idle
 		// state) pinpoint whether it's a genuine mid-run/lagging nit or a gate timing
 		// anomaly (agent parked at a final answer but currentTurnTerminal false).
-		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", advisorIdle, JSON.stringify(note).slice(0, 120));
+		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", advisorIdle, "parkedAtFinalAnswer=", parked, JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
 		const content = formatAdvisoryContent(notes, decision);
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
@@ -1198,6 +1233,8 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		currentTurnTerminal = false;
+		lastTurnWasTerminal = false;
+		lastCtx = undefined;
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
@@ -1210,6 +1247,8 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		currentTurnTerminal = false;
+		lastTurnWasTerminal = false;
+		lastCtx = undefined;
 	}
 
 	// ---- build the advisor agent lazily (needs ctx for model/registry/cwd) ----
@@ -1308,6 +1347,11 @@ export default function (pi: ExtensionAPI) {
 		// self-contained-final-answer guidance.
 		const terminal = isTerminalTurn(event.message as any);
 		currentTurnTerminal = terminal;
+		// Survives turn_start (unlike currentTurnTerminal); lets a lagging review that
+		// delivers after the agent parks still see that the last turn was a final answer.
+		lastTurnWasTerminal = terminal;
+		// Live handle for primaryIdle() from lagging-review delivery callbacks.
+		lastCtx = ctx as any;
 
 		const rt = await ensureRuntime(ctx as any);
 		dbg("turn_end", "terminal=", terminal, "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);

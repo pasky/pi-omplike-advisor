@@ -177,6 +177,18 @@ test("decideNit: a nit is held only when parked at a terminal turn with a review
 	assert.deepEqual(A.decideNit("nit", false, true), { stale: true, finalAnswer: false });
 });
 
+test("decideNit: a lagging nit delivered to a parked agent restates even when currentTurnTerminal raced false", () => {
+	// The real bug (confirmed from a live transcript): a review finishes seconds
+	// after the agent parked at a final answer; currentTurnTerminal is false by then,
+	// but parkedAtFinalAnswer=true, so the inline nit must still restate: it IS a
+	// followup to the final answer.
+	assert.deepEqual(A.decideNit("nit", false, true, true), { stale: true, finalAnswer: true });
+	// mid-run (not parked) stays no-restate even with the param present.
+	assert.deepEqual(A.decideNit("nit", false, false, false), { stale: true, finalAnswer: false });
+	// high severity is still held regardless of parked state.
+	assert.equal(A.decideNit("blocker", false, true, true), "hold");
+});
+
 test("decideNit: delivered flags feed formatAdvisoryContent consistently", () => {
 	const followup = A.decideNit("nit", true, true); // terminal followup via idle advisor
 	assert.notEqual(followup, "hold");
@@ -1269,6 +1281,43 @@ test("lifecycle: turn_end sets terminal, turn_start resets it, and inline nit fl
 	assert.equal(sent.length, 2);
 	assert.doesNotMatch(sent[1].content, /self-contained final answer/, "after turn_start the agent is working again — no stale restate");
 	assert.match(sent[1].content, /context="raised about an earlier step"/, "still an earlier-step nit");
+});
+
+// The confirmed real bug: a review LAGS, finishes seconds after the agent parked
+// at a final answer, and delivers its nit inline. currentTurnTerminal has raced
+// false by then (a turn_start cleared it), but the agent IS parked at a final
+// answer, so the nit must restate. Drives the real handlers with a live isIdle().
+test("lifecycle: a lagging nit delivered to a parked agent restates (currentTurnTerminal raced false)", async () => {
+	assert.ok(!process.env.ADVISOR_NO_REVIEW, "needs the real turn_end handler");
+	const sent = [];
+	let idle = false; // primary streaming while turns run; flips true once parked
+	const runtime = createExtensionRuntime();
+	runtime.sendMessage = (msg) => sent.push({ content: msg.content });
+	const res = await loadExtensions(["advisor.ts"], HERE, createEventBus(), runtime);
+	assert.deepEqual(res.errors, []);
+	const ext = res.extensions[0];
+	const h = (name) => {
+		const v = ext.handlers.get(name);
+		return Array.isArray(v) ? v[0] : v;
+	};
+	const cmd = ext.commands.get("advisor").handler;
+	const uiCtx = { ui: { notify: () => {} } };
+	// isIdle() delegates to the live primary; the extension captures this ctx.
+	const turnCtx = { model: undefined, cwd: HERE, isIdle: () => idle };
+	const terminalMsg = { message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } };
+
+	// Terminal turn ends (lastTurnWasTerminal := true, currentTurnTerminal := true).
+	await h("turn_end")(terminalMsg, turnCtx);
+	// A later turn_start races currentTurnTerminal to false (this is what happens
+	// with advisory-triggered/steered turns), then the agent parks.
+	h("turn_start")({}, turnCtx);
+	idle = true; // agent is now parked at the final answer
+
+	// The lagging review's nit fires now.
+	await cmd("test nit lagging", uiCtx);
+	assert.equal(sent.length, 1);
+	assert.match(sent[0].content, /self-contained final answer/, "a nit landing on a parked-at-final-answer agent must restate");
+	assert.match(sent[0].content, /context="raised about an earlier step"/, "it is still a lagging earlier-step nit");
 });
 
 // ===========================================================================
