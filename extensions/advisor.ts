@@ -1130,7 +1130,8 @@ export default function (pi: ExtensionAPI) {
 		// primary is parked at a terminal turn with a review still in flight so it rides
 		// the terminal catch-up (delivered with the restate directive) rather than
 		// steering mid-review; otherwise it's an earlier-step nit delivered inline.
-		const decision = decideNit(severity, currentTurnTerminal, runtime ? runtime.idle : true);
+		const advisorIdle = runtime ? runtime.idle : true;
+		const decision = decideNit(severity, currentTurnTerminal, advisorIdle);
 		if (decision === "hold") {
 			dbg(isHighSeverity(severity) ? "deliverAdvice hold" : "deliverAdvice hold (terminal-turn nit)", severity, JSON.stringify(note).slice(0, 120));
 			runtime?.hold(note, severity);
@@ -1156,7 +1157,7 @@ export default function (pi: ExtensionAPI) {
 		// terminal-hold gate was false, so currentTurnTerminal (and the advisor's idle
 		// state) pinpoint whether it's a genuine mid-run/lagging nit or a gate timing
 		// anomaly (agent parked at a final answer but currentTurnTerminal false).
-		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", runtime?.idle, JSON.stringify(note).slice(0, 120));
+		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", advisorIdle, JSON.stringify(note).slice(0, 120));
 		const notes: AdvisorNote[] = [{ note, severity }];
 		const content = formatAdvisoryContent(notes, decision);
 		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
@@ -1276,13 +1277,16 @@ export default function (pi: ExtensionAPI) {
 	// before_agent_start fires ONLY for the user-message path (agent-session.ts
 	// emits it inside prompt()). A turn woken by our own steered advisory with
 	// triggerTurn goes straight through _runAgentPrompt and never emits it, so the
-	// reset above would be skipped and currentTurnTerminal would stay stale-true
-	// across the advisory-triggered turn (until its first turn_end). agent_start is
-	// emitted from the agent's own event stream for EVERY run, so mirror the
-	// terminal-flag reset here: once any run begins, the agent is working, not
-	// parked at a final answer. (pendingUserPrompt/autoResumeSuppressed stay tied to
-	// before_agent_start — those are genuinely user-turn-only.)
-	pi.on("agent_start", () => {
+	// reset above is skipped and currentTurnTerminal would stay stale-true across the
+	// advisory-triggered turn. turn_start fires for EVERY turn — the first turn of a
+	// triggerTurn-woken run AND same-run steered continuations after a terminal
+	// turn_end (e.g. held advice steered into a still-streaming agent) — so it is the
+	// complete reset point: once any turn begins, the agent is working again, not
+	// parked at a final answer. Ordering within a run is agent_start → turn_start →
+	// (work) → turn_end, so this reset always precedes the turn_end that re-derives
+	// the flag; no stale-true window survives. (pendingUserPrompt/autoResumeSuppressed
+	// stay tied to before_agent_start — those are genuinely user-turn-only.)
+	pi.on("turn_start", () => {
 		if (!enabled) return;
 		currentTurnTerminal = false;
 	});

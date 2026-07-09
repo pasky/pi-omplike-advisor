@@ -702,6 +702,10 @@ test("integration: a nit is delivered during review, not held, never blocks", as
 	assert.equal(h.rt.hasHeld, false);
 	assert.equal(h.delivered.length, 1);
 	assert.equal(h.delivered[0].kind, "nit");
+	// oracle: a mid-run inline nit is about an earlier/superseded step and carries no
+	// restate (the agent hasn't returned a final answer this turn).
+	assert.equal(h.delivered[0].stale, true, "mid-run inline nit is stale");
+	assert.equal(h.delivered[0].finalAnswer, false, "mid-run inline nit does not restate");
 });
 
 test("integration: terminal turn — a nit from the lagging previous-turn review is held, reconfirmed by the final turn's review, then delivered", async () => {
@@ -1223,6 +1227,48 @@ test("extension loads + registers /advisor command and advisory renderer", async
 	const ext = await loadAdvisorExtension();
 	assert.ok(ext.commands.has("advisor"), "registers /advisor");
 	assert.ok(ext.messageRenderers.has("advisory"), "registers advisory renderer");
+});
+
+// Drive the REAL extension handlers (not the mirror) to regression-test the
+// currentTurnTerminal lifecycle across a turn boundary: a terminal turn_end sets
+// it, and turn_start (the fix for advisory-triggered / same-run steered turns,
+// which skip before_agent_start) must reset it so a later inline nit no longer
+// claims a final answer. Uses the /advisor test hook (calls the real
+// deliverAdvice with runtime idle) so decideNit takes the currentTurnTerminal
+// path directly.
+test("lifecycle: turn_end sets terminal, turn_start resets it, and inline nit flags follow", async () => {
+	assert.ok(!process.env.ADVISOR_NO_REVIEW, "this test needs the real turn_end handler (no ADVISOR_NO_REVIEW)");
+	const sent = [];
+	const runtime = createExtensionRuntime();
+	runtime.sendMessage = (msg, opts) => sent.push({ content: msg.content, opts });
+	const res = await loadExtensions(["advisor.ts"], HERE, createEventBus(), runtime);
+	assert.deepEqual(res.errors, []);
+	const ext = res.extensions[0];
+	const h = (name) => {
+		const v = ext.handlers.get(name);
+		return Array.isArray(v) ? v[0] : v;
+	};
+	const cmd = ext.commands.get("advisor").handler;
+	const uiCtx = { ui: { notify: () => {} } };
+	// ctx.model undefined → ensureRuntime bails (no advisor model needed); the
+	// terminal flag is still set before that early return.
+	const turnCtx = { model: undefined, cwd: HERE };
+	const terminalMsg = { message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } };
+
+	// 1) terminal turn ends → parked at a final answer.
+	await h("turn_end")(terminalMsg, turnCtx);
+	await cmd("test nit alpha", uiCtx);
+	assert.equal(sent.length, 1, "nit delivered inline (advisor idle, so not held)");
+	assert.match(sent[0].content, /self-contained final answer/, "nit after a terminal turn restates");
+	assert.match(sent[0].content, /context="raised about an earlier step"/);
+
+	// 2) a new turn begins (turn_start) — e.g. an advisory-triggered or steered turn
+	// that never fires before_agent_start. The flag must clear.
+	h("turn_start")({}, turnCtx);
+	await cmd("test nit beta", uiCtx);
+	assert.equal(sent.length, 2);
+	assert.doesNotMatch(sent[1].content, /self-contained final answer/, "after turn_start the agent is working again — no stale restate");
+	assert.match(sent[1].content, /context="raised about an earlier step"/, "still an earlier-step nit");
 });
 
 // ===========================================================================
