@@ -13,16 +13,19 @@ agent's transcript one turn-delta at a time and may inject short advice back
 into the conversation. It is **not** an executor: it cannot edit files, run
 commands, or change session state.
 
-Advice is emitted at three severities, with different delivery semantics:
+All severities enter one pending-advice queue; turn boundaries and advisor-review
+completion are the only places that flush it. Delivery policy then differs by
+severity:
 
-- **nit** — delivered immediately (steered in and wakes an idle agent), tagged
-  as raised about an earlier step. Low-stakes; mild staleness is fine.
-  Exception: once the primary stops at a terminal turn, nits are held too and
-  land when the advisor settles — a nit from a review lagging the final turn
-  must survive the final review's reconfirmation — so the final answer is never
-  chased by a stale nit about already-superseded work. If the advisor can't
-  reconfirm in time, only concerns/blockers ship best-effort; unconfirmed nits
-  stay held for a later reconfirm.
+- **nit** — tagged as raised about an earlier step. If observed while the
+  assistant is responding, it waits for that turn's boundary (Pi would not
+  insert a steer before then anyway). A non-terminal turn flushes it before the
+  next step; a terminal turn sends it through final-review reconfirmation, so
+  obsolete lagging advice is dropped and surviving advice lands with a request
+  for a fresh, self-contained final answer. If the advisor cannot reconfirm in
+  time, only concerns/blockers ship best-effort; unconfirmed nits remain queued.
+  A successful late review reconciles them, otherwise the next turn boundary
+  applies the normal low-stakes nit policy.
 - **concern** / **blocker** — always held on first emission, never steered
   immediately. Because review is asynchronous (seconds), high-severity advice is
   usually stale by the time it could land, so it is held and re-confirmed by the

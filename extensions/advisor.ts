@@ -6,21 +6,24 @@
  * Enable with `/advisor on` (persisted). The advisor model defaults to
  * openrouter/z-ai/glm-5.2 (override via an "advisor" entry in modes.json).
  *
- * Delivery model. Nothing here is a hard interrupt: upstream pi's extension
- * surface delivers via `steer` (the message folds in at the agent's next step
- * boundary; `triggerTurn` additionally wakes an idle agent). We never call
+ * Delivery model. Every advise() call enters one shared queue; only primary turn
+ * boundaries or advisor-review completion flush it. Nothing is a hard interrupt:
+ * upstream pi's extension surface delivers via `steer` (the message folds in at
+ * the agent's next-step boundary; `triggerTurn` additionally wakes an idle agent). We never call
  * `abort()`. So:
  *
- *   nit      → delivered immediately (steer + triggerTurn), tagged as raised
- *              about an earlier step. Low-stakes; mild staleness is fine.
- *              Exception: once the primary stops at a terminal turn, nits are
- *              held too (advise callbacks only fire while a review is in
- *              flight): one from a review LAGGING the final turn rides the
- *              final review's reconfirm preamble and must survive it; one from
- *              the final turn's own review just waits for settle. Either way
- *              the final answer is never chased by a nit steered mid-review,
- *              and the terminal best-effort path ships only concerns/blockers
- *              (an unconfirmed nit is what holding was meant to keep away).
+ *   nit      → tagged as raised about an earlier step. If observed while an
+ *              assistant turn is running, delivery waits for turn_end because
+ *              Pi would not insert its steer before then anyway: non-terminal
+ *              turns flush it before the next step, while terminal turns route
+ *              it through final-review reconfirmation. Thus obsolete lagging
+ *              nits are dropped and survivors delivered after a final answer
+ *              carry the self-contained-restatement directive. Deferral can
+ *              place intervening user/extension steers before the advisory;
+ *              correctness of terminal classification takes precedence over
+ *              preserving callback-time queue order.
+ *              The terminal best-effort path ships only concerns/blockers (an
+ *              unconfirmed nit is what holding was meant to keep away).
  *   concern  → ALWAYS held, never steered on first emission.
  *   blocker  → ALWAYS held, never steered on first emission.
  *
@@ -112,9 +115,9 @@ export function isTerminalTurn(message: { content?: ReadonlyArray<{ type: string
 
 /** Structural slice of AdvisorRuntime the catch-up block needs (so it's testable). */
 export interface TurnBlockRuntime {
-	readonly hasHeld: boolean;
-	takeHeld(): AdvisorNote[];
-	hold(note: string, severity?: AdvisorSeverity): void;
+	readonly hasHighPriority: boolean;
+	takeAllAdvice(): AdvisorNote[];
+	requeueAdvice(note: string, severity?: AdvisorSeverity): void;
 	waitUntilSettled(timeoutMs: number, signal?: AbortSignal): Promise<"settled" | "timeout" | "aborted" | "failed">;
 }
 
@@ -129,14 +132,11 @@ export interface TurnBlockRuntime {
  *                  notes and lengthen the next wait (return consecutiveBlocks+1).
  * - On settle: steer in whatever survived reconfirmation (may be empty), reset streak.
  * - On timeout / failed reconfirm (advisor errored out): non-terminal keeps the
- *   held notes and lengthens the next wait; terminal delivers concerns/blockers
+ *   queued advice and lengthens the next wait; terminal delivers concerns/blockers
  *   best-effort (it's the last chance before control returns to the user, and
- *   the stakes justify an unconfirmed delivery) but keeps NITS held — an
- *   unconfirmed nit chasing the final answer is exactly what holding it was
- *   meant to prevent, and if the session continues it rides the next reconfirm.
- *   (For a note first raised about the final turn itself the note is current —
- *   the agent did no follow-up — but a lagging previous-turn nit is not
- *   distinguishable here, so nits uniformly stay held.)
+ *   the stakes justify an unconfirmed delivery) but requeues NITS without marking
+ *   them reconfirmed. A successful late review can then prune or confirm them;
+ *   after failure, the next primary boundary applies normal nit policy.
  * - On abort (user hit Escape): bail, keep held notes + streak.
  */
 export async function runTurnBlock(opts: {
@@ -152,7 +152,7 @@ export async function runTurnBlock(opts: {
 	const { terminal, runtime } = opts;
 	const baseMs = opts.baseMs ?? 15_000;
 	const capMs = opts.capMs ?? 120_000;
-	if (!terminal && !runtime.hasHeld) return 0;
+	if (!terminal && !runtime.hasHighPriority) return 0;
 
 	const timeoutMs = terminal ? capMs : nextBackoffMs(opts.consecutiveBlocks, baseMs, capMs);
 	opts.notify(
@@ -165,20 +165,19 @@ export async function runTurnBlock(opts: {
 	if (result === "aborted") return opts.consecutiveBlocks; // user bailed; keep held + streak
 	if (result === "settled") {
 		// Only a successful reconfirmation settles; the advisor has pruned recanted
-		// notes, so #held is the confirmed survivor set.
-		const held = runtime.takeHeld();
+		// entries, so the shared queue is the confirmed survivor set.
+		const held = runtime.takeAllAdvice();
 		if (held.length) opts.deliverHeld(held, { terminal });
 		return 0;
 	}
 	// timeout OR failed (advisor errored 3x and dropped the reconfirm). Either way
 	// the held notes are NOT confirmed.
 	if (terminal) {
-		// Best-effort only for concerns/blockers. Unconfirmed nits are re-held: they
-		// aren't worth chasing the final answer with, and they ride the next
-		// reconfirm preamble if the user continues the session.
-		const held = runtime.takeHeld();
+		// Best-effort only for concerns/blockers. Requeue nits WITHOUT marking a
+		// reconfirmation; a late successful review may still prune them.
+		const held = runtime.takeAllAdvice();
 		const high = held.filter((n) => isHighSeverity(n.severity));
-		for (const n of held) if (!isHighSeverity(n.severity)) runtime.hold(n.note, n.severity);
+		for (const n of held) if (!isHighSeverity(n.severity)) runtime.requeueAdvice(n.note, n.severity);
 		if (high.length) {
 			opts.deliverHeld(high, { terminal: true });
 			opts.notify("advisor didn't reconfirm in time; delivering held advice anyway");
@@ -219,8 +218,8 @@ export function parseAdvisorTestArgs(args: string): { severity: AdvisorSeverity;
  * The advise tool. Dedupes by normalized note text + severity rank: a repeat at
  * the same-or-lower severity is dropped, a real escalation (nit→concern→blocker)
  * passes through. Dedup is recorded only when the note is actually *delivered*
- * (`onAdvice` returns true) — a note that is held for reconfirmation returns
- * false and is left unrecorded so it can re-fire and land once it's confirmed.
+ * (`onAdvice` returns true). Queued or dropped advice returns false and stays
+ * unrecorded until its actual boundary delivery.
  */
 export class AdviseTool {
 	readonly name = "advise";
@@ -230,8 +229,7 @@ export class AdviseTool {
 	readonly parameters = adviseSchema as any;
 	#delivered = new Map<string, number>();
 
-	// onAdvice returns true if the note was delivered, false if it was held
-	// (high severity) and should be re-offered/reconfirmed later.
+	// onAdvice returns true if delivered, false if queued or dropped.
 	constructor(private readonly onAdvice: (note: string, severity?: AdvisorSeverity) => boolean) {}
 
 	resetDelivered(): void {
@@ -257,8 +255,8 @@ export class AdviseTool {
 		}
 		const delivered = this.onAdvice(args.note, args.severity);
 		if (!delivered) {
-			// Held for reconfirmation: leave undealt so it can re-fire and land later.
-			return { content: [{ type: "text", text: "Held pending reconfirmation." }], details: { ...args, held: true } };
+			// Not recorded: it is queued for a boundary or dropped as stale.
+			return { content: [{ type: "text", text: "Queued for boundary delivery (or dropped as stale)." }], details: { ...args, held: true } };
 		}
 		this.#delivered.set(key, rank);
 		return { content: [{ type: "text", text: "Recorded." }], details: { ...args } };
@@ -293,43 +291,8 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 	return `${body}\n\nYou had already returned a final answer to the user this turn. If you act on the advice above, respond with a new, self-contained final answer that fully stands on its own — do NOT write a terse follow-up that assumes the user read your previous message. The user should be able to read your new reply alone and get the complete answer.`;
 }
 
-/** "hold this nit for reconfirmation" or "deliver it inline with these content flags". */
-export type NitDecision = "hold" | { stale: boolean; finalAnswer: boolean };
-
-/**
- * The core nit-delivery decision, factored out so the live deliverAdvice path and
- * the integration tests share ONE source of truth instead of the tests mirroring
- * a private copy that silently drifts (which is exactly why the delivery flags
- * went untested). It intentionally excludes the stateful reconfirm-a-held-note
- * check (runtime.reconfirmIfHeld mutates) — that stays inline between this hold
- * decision and the actual send.
- *
- * - concern/blocker → always held (reconfirmed against unraced state later).
- * - nit for the turn that is CURRENTLY ending as terminal, with a review still in
- *   flight (`currentTurnTerminal && !advisorIdle`) → held, so it rides the terminal
- *   catch-up and is delivered with the restate directive rather than steering
- *   mid-review. (Note: this is distinct from `parkedAtFinalAnswer`, where the agent
- *   has ALREADY gone idle — that case is delivered inline below, not held, since no
- *   catch-up block is running to flush it.)
- * - otherwise deliver inline. Such a nit is always about an earlier/superseded
- *   step (a *current* nit from the terminal review is held by the branch above),
- *   hence `stale: true`; it carries the restate directive when it is a followup to
- *   a final answer, either because the turn currently ending is terminal
- *   (`currentTurnTerminal`, e.g. the terminal catch-up or the `/advisor test` hook)
- *   OR the primary is already parked at a final answer (`parkedAtFinalAnswer`, the
- *   case a lagging review hits when it fires seconds after the agent went idle;
- *   currentTurnTerminal races false there, which is the bug this parameter fixes).
- */
-export function decideNit(
-	severity: AdvisorSeverity | undefined,
-	currentTurnTerminal: boolean,
-	advisorIdle: boolean,
-	parkedAtFinalAnswer = false,
-): NitDecision {
-	if (isHighSeverity(severity)) return "hold";
-	if (currentTurnTerminal && !advisorIdle) return "hold";
-	return { stale: true, finalAnswer: currentTurnTerminal || parkedAtFinalAnswer };
-}
+/** Where the primary is in its turn lifecycle. */
+export type PrimaryTurnState = "running" | "ended-terminal" | "ended-nonterminal";
 
 // ---- transcript delta formatting (primary turn → markdown for the advisor) ----
 
@@ -342,8 +305,8 @@ export function decideNit(
 //
 // Input-budget policy (advisor self-compaction): the advisor's context is a pure
 // linear accumulation of INDEPENDENT turn deltas — no essential cross-turn state
-// lives in the agent's message history (held notes live in #held and ride the
-// reconfirm preamble, not the transcript). So when the advisor's own context
+// lives in the agent's message history (pending advice lives in the shared queue
+// and rides the reconfirm preamble, not the transcript). So when the advisor's own context
 // approaches the window it self-compacts: #drain clears ONLY the agent's message
 // history (#softReset) and replays the current batch into a fresh context. Two
 // triggers — PROACTIVE (before prompting, when usage crosses COMPACT_AT_PERCENT)
@@ -518,12 +481,14 @@ function buildAdvisorAgent(opts: {
  */
 export class AdvisorRuntime {
 	#pending: string[] = [];
-	#held: AdvisorNote[] = [];
+	// The ONE pending-advice queue. Nits, concerns, and blockers all enter here;
+	// boundary policy decides which severities can leave and when.
+	#advice: AdvisorNote[] = [];
 	// Keys re-raised during the in-flight review; drives the post-review prune.
 	#reraised: Set<string> | undefined;
 	// Outcome of the most recently completed drain batch: "ok" (successful review)
 	// or "failed" (errored 3x and dropped). Lets waitUntilSettled distinguish a
-	// genuine settle from a give-up, so held notes aren't delivered as if confirmed.
+	// genuine settle from a give-up, so queued advice isn't delivered as confirmed.
 	#lastOutcome: "ok" | "failed" | undefined;
 	// Epoch of the in-flight review; advice callbacks are honored only while it still
 	// matches #epoch. A reset/dispose bumps #epoch, orphaning a stale review whose
@@ -556,15 +521,16 @@ export class AdvisorRuntime {
 		private readonly retryDelayMs = 1000,
 		private readonly onDebug?: (...a: unknown[]) => void,
 		compactAtPercent = 80,
+		private readonly onSettled?: (outcome: "ok" | "failed") => void,
 	) {
 		this.compactAtPercent = compactAtPercent;
 	}
 
 	/**
 	 * Self-compaction: clear ONLY the advisor agent's own message history,
-	 * preserving the pending queue, held notes, backlog, failure count, and settle
-	 * waiters. Safe because the agent transcript is a pure linear accumulation of
-	 * independent turn deltas — no essential cross-turn state lives there (held
+	 * preserving pending deltas/advice, backlog, failure count, and settle waiters.
+	 * Safe because the agent transcript is a pure linear accumulation of independent
+	 * turn deltas — no essential cross-turn state lives there (held
 	 * notes ride the reconfirm preamble). Unlike reset(), this does NOT bump the
 	 * epoch (the in-flight review is ours, not orphaned) nor drop queued/held work.
 	 */
@@ -597,54 +563,47 @@ export class AdvisorRuntime {
 		return !this.#busy && this.#pending.length === 0;
 	}
 
-	/** Whether any note is currently held awaiting reconfirmation/settle. */
-	get hasHeld(): boolean {
-		return this.#held.length > 0;
+	/** Whether the shared queue contains anything worth blocking a mid-run turn for. */
+	get hasHighPriority(): boolean {
+		return this.#advice.some((n) => isHighSeverity(n.severity));
 	}
 
-	/**
-	 * Stash a note for reconfirmation (high severity always; also any nit raised
-	 * while the primary is stopped at a terminal turn). It rides the next review as a
-	 * reconfirm preamble (see `#drain`); survivors are taken via `takeHeld()` and
-	 * steered in by the catch-up block once the advisor settles. Deduped by note
-	 * text so re-raising during a reconfirm doesn't pile up duplicates; the re-raise
-	 * is recorded so the post-review prune keeps it.
-	 */
-	hold(note: string, severity?: AdvisorSeverity): void {
+	#upsertAdvice(note: string, severity?: AdvisorSeverity): void {
 		if (this.disposed) return;
 		const key = dedupeKey(note);
-		this.#reraised?.add(key);
-		const existing = this.#held.find((n) => dedupeKey(n.note) === key);
-		if (!existing) {
-			this.#held.push({ note, severity });
-		} else if (rankOf(severity) > rankOf(existing.severity)) {
-			// Honor an escalation (e.g. a held concern re-raised as a blocker).
-			existing.severity = severity;
-		}
+		const existing = this.#advice.find((n) => dedupeKey(n.note) === key);
+		if (!existing) this.#advice.push({ note, severity });
+		else if (rankOf(severity) > rankOf(existing.severity)) existing.severity = severity;
 	}
 
-	/** Remove and return the currently-held notes (the reconfirmation survivors). */
-	takeHeld(): AdvisorNote[] {
-		return this.#held.splice(0);
+	/** Advisor observation: upsert and count as a genuine reconfirmation. */
+	enqueueAdvice(note: string, severity?: AdvisorSeverity): void {
+		if (this.disposed) return;
+		this.#reraised?.add(dedupeKey(note));
+		this.#upsertAdvice(note, severity);
+	}
+
+	/** Boundary bookkeeping: put advice back without faking a reconfirmation. */
+	requeueAdvice(note: string, severity?: AdvisorSeverity): void {
+		this.#upsertAdvice(note, severity);
+	}
+
+	/** Drain nits only; concerns/blockers remain queued for reconfirmation. */
+	takeNits(): AdvisorNote[] {
+		const nits = this.#advice.filter((n) => !isHighSeverity(n.severity));
+		this.#advice = this.#advice.filter((n) => isHighSeverity(n.severity));
+		return nits;
+	}
+
+	/** Drain every queued survivor after successful boundary reconciliation. */
+	takeAllAdvice(): AdvisorNote[] {
+		return this.#advice.splice(0);
 	}
 
 	/** Whether advice from the in-flight review is still valid (not orphaned by a
 	 *  reset/dispose). The delivery layer consults this to drop late stale callbacks. */
 	get acceptingAdvice(): boolean {
 		return !this.disposed && this.#reviewEpoch === this.#epoch;
-	}
-
-	/**
-	 * If `note` matches a currently-held note, count it as a reconfirmation (so the
-	 * post-review prune keeps it) and return true. Lets the delivery layer suppress a
-	 * de-escalation (a held blocker re-raised as a nit) instead of dropping the
-	 * blocker and shipping a nit.
-	 */
-	reconfirmIfHeld(note: string): boolean {
-		const key = dedupeKey(note);
-		if (!this.#held.some((n) => dedupeKey(n.note) === key)) return false;
-		this.#reraised?.add(key);
-		return true;
 	}
 
 	/**
@@ -729,7 +688,7 @@ export class AdvisorRuntime {
 	reset(): void {
 		this.#epoch++;
 		this.#pending = [];
-		this.#held = [];
+		this.#advice = [];
 		this.#reraised = undefined;
 		this.#lastOutcome = undefined;
 		this.#backlog = 0;
@@ -750,7 +709,7 @@ export class AdvisorRuntime {
 		this.disposed = true;
 		this.#epoch++;
 		this.#pending = [];
-		this.#held = [];
+		this.#advice = [];
 		this.#reraised = undefined;
 		this.#lastOutcome = undefined;
 		this.#backlog = 0;
@@ -770,13 +729,11 @@ export class AdvisorRuntime {
 				// Rough gauge of how many turns are still unreviewed (status display only).
 				this.#backlog = Math.max(0, this.#backlog - turns);
 				const epoch = this.#epoch;
-				// Re-offer held notes as a reconfirm preamble WITHOUT removing them from
-				// #held: hasHeld/takeHeld must stay accurate while this review is in flight
-				// (the catch-up block reads them concurrently — `push()` runs `#drain` up to
-				// the first await, so a splice here would empty #held before the block even
-				// looks). After a successful review we prune any offered note the advisor
-				// did NOT re-raise (it's been resolved).
-				const offered = [...this.#held];
+				// Re-offer the shared advice queue without removing it. On success, entries
+				// not re-raised are resolved and pruned. Snapshot by value so a discarded
+				// overflow attempt can restore prior severities without resurrecting entries
+				// concurrently drained at a primary turn boundary.
+				const offered = this.#advice.map((n) => ({ ...n }));
 				const offeredKeys = new Set(offered.map((n) => dedupeKey(n.note)));
 				const preamble = formatReconfirmPreamble(offered);
 				this.#reraised = new Set();
@@ -796,11 +753,11 @@ export class AdvisorRuntime {
 				// A review "fails" either by throwing OR — the common case — by resolving
 				// with an assistant message whose stopReason is "error"/"aborted" (the agent
 				// loop records provider failures that way instead of throwing). A failed
-				// review must NOT prune held notes (we'd drop them as if recanted).
+				// review must NOT prune queued advice (we'd drop it as if recanted).
 				let failed = false;
 				// PROACTIVE self-compaction: if our own context has crossed the budget,
 				// clear the agent history now so this batch replays into a fresh context
-				// (held notes survive via the reconfirm preamble) instead of marching into
+				// (queued advice survives via the reconfirm preamble) instead of marching into
 				// an overflow. Skipped when already fresh (nothing to reclaim).
 				const pct = this.usage.contextPercent;
 				if (pct !== null && pct >= this.compactAtPercent && this.agent.state.messages.length > 0) {
@@ -827,16 +784,13 @@ export class AdvisorRuntime {
 						if (last?.stopReason === "length" && attempt === 0) {
 							this.onDebug?.("advisor context overflow, self-compacting (reactive) and replaying batch fresh");
 							this.#softReset();
-							// Roll back any concern/blocker the DISCARDED overflowed attempt held:
-							// it was raised against a truncated view, and offeredKeys was snapshotted
-							// pre-attempt so the success-prune below can't reach it — left in place
-							// it would later deliver (e.g. terminal best-effort) as if confirmed.
-							// The fresh replay re-raises it if genuine; otherwise it's correctly
-							// gone. Exact: #held only GROWS during an attempt (hold() never removes),
-							// so restoring the pre-batch snapshot drops exactly the attempt's adds.
-							// (Nits were already steered + recorded in #delivered, which survives
-							// softReset, so the replay dedupes them — no double-fire.)
-							this.#held = offered.slice();
+							// Roll back attempt-only queue mutations by intersection. Concurrently
+							// drained entries stay gone; surviving pre-attempt entries regain severity.
+							const before = new Map(offered.map((n) => [dedupeKey(n.note), n]));
+							this.#advice = this.#advice.flatMap((current) => {
+								const prior = before.get(dedupeKey(current.note));
+								return prior ? [{ ...current, severity: prior.severity }] : [];
+							});
 							this.#reraised = new Set();
 							continue;
 						}
@@ -849,16 +803,16 @@ export class AdvisorRuntime {
 					if (last?.stopReason === "error" || last?.stopReason === "aborted" || last?.stopReason === "length") {
 						// error/aborted = provider failure (recorded, not thrown); length =
 						// truncated review (a fresh replay still didn't fit) — in all three the
-						// advisor didn't finish, so don't prune held notes on its accidental
+						// advisor didn't finish, so don't prune queued advice on its accidental
 						// "silence".
 						this.onDebug?.("advisor review incomplete, stop=", last?.stopReason, "err=", last?.errorMessage ?? "-");
 						failed = true;
 					} else {
-						// Success: prune recanted holds (offered notes the advisor stayed silent on).
+						// Success: prune offered queue entries the advisor stayed silent on.
 						for (const key of offeredKeys) {
 							if (!this.#reraised?.has(key)) {
-								const i = this.#held.findIndex((n) => dedupeKey(n.note) === key);
-								if (i >= 0) this.#held.splice(i, 1);
+								const i = this.#advice.findIndex((n) => dedupeKey(n.note) === key);
+								if (i >= 0) this.#advice.splice(i, 1);
 							}
 						}
 						this.#lastOutcome = "ok";
@@ -890,7 +844,14 @@ export class AdvisorRuntime {
 			}
 		} finally {
 			this.#busy = false;
-			if (this.idle) this.#notifySettled();
+			if (this.idle) {
+				this.#notifySettled();
+				try {
+					this.onSettled?.(this.#lastOutcome === "failed" ? "failed" : "ok");
+				} catch (e) {
+					this.onDebug?.("advisor onSettled callback threw", String(e));
+				}
+			}
 		}
 	}
 }
@@ -1080,36 +1041,8 @@ export default function (pi: ExtensionAPI) {
 	// the user just stopped. Cleared when the user drives the next turn.
 	let autoResumeSuppressed = false;
 
-	// Whether the primary is currently stopped, having returned a final answer (the
-	// most recent turn was terminal and the user hasn't driven a new one yet). When
-	// true, advice we steer in wakes the stopped agent for a follow-up turn, so we
-	// tell it to reply with a fresh, self-contained final answer rather than a
-	// back-and-forth the user must stitch together. Set at turn_end (before any
-	// await, since late nit callbacks read it) and cleared at before_agent_start.
-	let currentTurnTerminal = false;
-
-	// Terminality of the last COMPLETED turn, set at every turn_end and NEVER reset
-	// on turn_start/before_agent_start. Unlike currentTurnTerminal (cleared the moment
-	// a new turn begins), this survives so that when the primary is idle it
-	// authoritatively answers "is the agent parked at a final answer?", the reliable
-	// signal a lagging review needs when it delivers a nit seconds after the agent
-	// parked (a window in which currentTurnTerminal alone races false).
-	let lastTurnWasTerminal = false;
-
-	// Latest event ctx, captured so a delivery callback firing from a lagging review
-	// (outside its own handler) can query LIVE primary state. isIdle() === !isStreaming.
-	let lastCtx: { isIdle?: () => boolean } | undefined;
-	const primaryIdle = (): boolean => {
-		try {
-			return !!lastCtx?.isIdle?.();
-		} catch {
-			return false;
-		}
-	};
-	// Authoritative "the steer lands as a followup to a final answer": primary parked
-	// (idle) AND its last completed turn was terminal. Robust to abort/mid-tool idle
-	// (last turn non-terminal makes this false) unlike a bare isIdle() check.
-	const parkedAtFinalAnswer = (): boolean => primaryIdle() && lastTurnWasTerminal;
+	// One source of truth for which primary boundary a queue flush belongs to.
+	let turnState: PrimaryTurnState = "ended-nonterminal";
 
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
@@ -1138,91 +1071,89 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---- advice delivery into the primary session ----
-	// Called synchronously by the advise tool during a review. Returns true if the
-	// note was delivered now (recorded for dedup), false if held for reconfirmation
-	// (left unrecorded so it can re-fire; the catch-up block delivers survivors).
-	function deliverAdvice(note: string, severity?: AdvisorSeverity): boolean {
+	function sendNit(note: string, severity: AdvisorSeverity | undefined, finalAnswer: boolean): void {
+		const notes: AdvisorNote[] = [{ note, severity }];
+		const content = formatAdvisoryContent(notes, { stale: true, finalAnswer });
+		pi.sendMessage(
+			{ customType: ADVISORY_TYPE, content, display: true, details: { notes } },
+			{ deliverAs: "steer", triggerTurn: !autoResumeSuppressed },
+		);
+	}
+
+	// The only immediate boundary flush: non-terminal turns drain queued nits.
+	// Concerns/blockers stay in the same queue for review reconfirmation.
+	function flushNits(rt: AdvisorRuntime | undefined): void {
+		if (!rt || handoffInProgress()) return;
+		for (const n of rt.takeNits()) {
+			sendNit(n.note, n.severity, false);
+			adviseTool?.markDelivered(n.note, n.severity);
+		}
+	}
+
+	// Advisor callbacks only enqueue. Delivery policy lives at primary boundaries,
+	// where terminality and reconfirmation state are actually known.
+	function deliverAdvice(note: string, severity?: AdvisorSeverity, sourceRuntime?: AdvisorRuntime): boolean {
 		// Stand down entirely while a handoff is being performed (see comment on
-		// HANDOFF_IN_PROGRESS_KEY). Report it as "delivered" so it isn't held into
-		// the brand-new session.
+		// HANDOFF_IN_PROGRESS_KEY).
 		if (handoffInProgress()) {
 			dbg("handoff in progress, dropping advice", severity, JSON.stringify(note).slice(0, 80));
-			return true;
+			// False means "not delivered", so AdviseTool does not poison the fresh
+			// session's dedup map with a dropped callback.
+			return false;
 		}
 		// Drop late callbacks the session has moved past: advisor turned off, or a
 		// reset/dispose orphaned the in-flight review (its epoch no longer matches).
-		// Report "delivered" so AdviseTool doesn't keep re-firing it.
-		if (!enabled || (runtime && !runtime.acceptingAdvice)) {
+		const targetRuntime = sourceRuntime ?? runtime;
+		if (!enabled || (sourceRuntime && sourceRuntime !== runtime) || (targetRuntime && !targetRuntime.acceptingAdvice)) {
 			dbg("dropping stale/disabled advice", severity, JSON.stringify(note).slice(0, 80));
+			// Especially after reset/replacement, never let an old callback enqueue into
+			// the fresh runtime or poison its cleared dedup map.
+			return false;
+		}
+
+		if (targetRuntime) {
+			targetRuntime.enqueueAdvice(note, severity);
+			dbg("queued advice", severity, JSON.stringify(note).slice(0, 120));
+			return false; // AdviseTool records only at the real boundary delivery.
+		}
+
+		// Hidden no-model test hook only: production advisor callbacks always have the
+		// runtime that created their AdviseTool. Keep idle command testing convenient.
+		if (!isHighSeverity(severity) && turnState !== "running") {
+			sendNit(note, severity, turnState === "ended-terminal");
 			return true;
 		}
-
-		// Hold-vs-deliver decision, shared with the integration tests via decideNit so
-		// the two can't drift. advisorIdle defaults to true when there's no runtime,
-		// matching the original gate `currentTurnTerminal && runtime && !runtime.idle`.
-		// Rationale (see decideNit): concern/blocker always held; a nit is held once the
-		// primary is parked at a terminal turn with a review still in flight so it rides
-		// the terminal catch-up (delivered with the restate directive) rather than
-		// steering mid-review; otherwise it's an earlier-step nit delivered inline.
-		const advisorIdle = runtime ? runtime.idle : true;
-		// parkedAtFinalAnswer catches the lagging-review case: the nit fires seconds
-		// after the agent went idle at a final answer, so it must restate even though
-		// currentTurnTerminal has raced false by then.
-		const parked = parkedAtFinalAnswer();
-		const decision = decideNit(severity, currentTurnTerminal, advisorIdle, parked);
-		if (decision === "hold") {
-			dbg(isHighSeverity(severity) ? "deliverAdvice hold" : "deliverAdvice hold (terminal-turn nit)", severity, JSON.stringify(note).slice(0, 120));
-			runtime?.hold(note, severity);
-			return false;
-		}
-
-		// A nit whose text matches a held high-severity note is a de-escalation the
-		// prompt forbids; treat it as a reconfirmation (keep the held note at its
-		// severity) instead of shipping a nit and pruning the blocker. Report it as
-		// HELD (false), not delivered: recording it in the dedup map here would let a
-		// retry of this review (after a provider error) get duplicate-dropped before
-		// it can re-reconfirm, silently pruning the held note on the retry's success.
-		// The dedup record is written at the real delivery point (deliverHeld).
-		if (runtime?.reconfirmIfHeld(note)) {
-			dbg("nit reconfirms a held note; keeping it held", JSON.stringify(note).slice(0, 120));
-			return false;
-		}
-
-		// nit: deliver inline with the flags decideNit computed. triggerTurn wakes an
-		// idle agent — unless the user just aborted (Escape), in which case we must not
-		// auto-resume the run they stopped.
-		// Log why this went inline rather than held: it reaches here only when the
-		// terminal-hold gate was false, so currentTurnTerminal (and the advisor's idle
-		// state) pinpoint whether it's a genuine mid-run/lagging nit or a gate timing
-		// anomaly (agent parked at a final answer but currentTurnTerminal false).
-		dbg("deliverAdvice nit", "currentTurnTerminal=", currentTurnTerminal, "advisorIdle=", advisorIdle, "parkedAtFinalAnswer=", parked, JSON.stringify(note).slice(0, 120));
-		const notes: AdvisorNote[] = [{ note, severity }];
-		const content = formatAdvisoryContent(notes, decision);
-		pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
-		return true;
+		return false;
 	}
 
 	// ---- steer held survivors into the primary (called by the catch-up block) ----
 	function deliverHeld(notes: AdvisorNote[], opts?: { terminal?: boolean }): void {
 		if (handoffInProgress() || !notes.length) return;
-		// The self-contained-final-answer guidance is gated on whether this delivery is
-		// a followup to a terminal message — i.e. the primary is stopped at a final
-		// answer RIGHT NOW (the live currentTurnTerminal flag), not on which turn
-		// generated the note. A note held from an earlier turn still restates iff it
-		// lands on a stopped/terminal primary. opts.terminal — the turn that triggered
-		// this block — must equal currentTurnTerminal at every call site (runTurnBlock
-		// runs inside turn_end, which sets the flag before calling it); we key off the
-		// live flag so generation-time is out of the decision by construction, and
-		// assert the invariant so a future out-of-band caller can't silently diverge.
-		if (opts && opts.terminal !== undefined && opts.terminal !== currentTurnTerminal)
-			dbg("deliverHeld: opts.terminal diverged from live currentTurnTerminal", opts.terminal, currentTurnTerminal);
+		// A held note restates iff it is delivered from a terminal turn's catch-up.
+		// turnState was set synchronously at turn_end before the block began.
+		const finalAnswer = turnState === "ended-terminal";
+		if (opts && opts.terminal !== undefined && opts.terminal !== finalAnswer)
+			dbg("deliverHeld: opts.terminal diverged from turnState", opts.terminal, turnState);
 		for (const n of notes) {
 			dbg("deliverHeld", n.severity, JSON.stringify(n.note).slice(0, 120));
-			const content = formatAdvisoryContent([n], { finalAnswer: currentTurnTerminal });
+			const content = formatAdvisoryContent([n], { finalAnswer, stale: !isHighSeverity(n.severity) });
 			pi.sendMessage({ customType: ADVISORY_TYPE, content, display: true, details: { notes: [n] } }, { deliverAs: "steer", triggerTurn: !autoResumeSuppressed });
 			// Record at the real delivery point (onAdvice→false never recorded it), so a
 			// later same-or-lower-severity repeat is deduped.
 			adviseTool?.markDelivered(n.note, n.severity);
+		}
+	}
+
+	// Reviews can finish after a primary turn_end timeout. Reuse the same boundary
+	// policy instead of creating a late-callback delivery path. This synchronous
+	// callback drains before a runTurnBlock waiter resumes; the latter then sees empty.
+	function flushSettledAdvice(outcome: "ok" | "failed"): void {
+		if (outcome !== "ok" || !runtime || handoffInProgress()) return;
+		if (turnState === "ended-terminal") {
+			const notes = runtime.takeAllAdvice();
+			if (notes.length) deliverHeld(notes, { terminal: true });
+		} else if (turnState === "ended-nonterminal") {
+			flushNits(runtime);
 		}
 	}
 
@@ -1235,9 +1166,7 @@ export default function (pi: ExtensionAPI) {
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
-		currentTurnTerminal = false;
-		lastTurnWasTerminal = false;
-		lastCtx = undefined;
+		turnState = "ended-nonterminal";
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
@@ -1249,9 +1178,7 @@ export default function (pi: ExtensionAPI) {
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
-		currentTurnTerminal = false;
-		lastTurnWasTerminal = false;
-		lastCtx = undefined;
+		turnState = "ended-nonterminal";
 	}
 
 	// ---- build the advisor agent lazily (needs ctx for model/registry/cwd) ----
@@ -1283,19 +1210,25 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!model) return undefined;
 
-		adviseTool = new AdviseTool(deliverAdvice);
+		let builtRuntime!: AdvisorRuntime;
+		const builtAdviseTool = new AdviseTool((note, severity) => deliverAdvice(note, severity, builtRuntime));
+		adviseTool = builtAdviseTool;
 		const agent = buildAdvisorAgent({
 			cwd: ctx.cwd,
 			model,
 			thinkingLevel,
 			systemPrompt: loadSystemPrompt(ctx.cwd),
 			modelRegistry: ctx.modelRegistry,
-			adviseTool,
+			adviseTool: builtAdviseTool,
 		});
 		// ADVISOR_COMPACT_AT: % of the advisor's context window at which it self-
 		// compacts (clamped 50..95; default 80).
 		const compactAt = Math.min(95, Math.max(50, Number(process.env.ADVISOR_COMPACT_AT) || 80));
-		runtime = new AdvisorRuntime(agent, adviseTool, 1000, dbg, compactAt);
+		builtRuntime = new AdvisorRuntime(agent, builtAdviseTool, 1000, dbg, compactAt, (outcome) => {
+			// A disposed/replaced runtime may settle late; never let it flush the new one.
+			if (runtime === builtRuntime) flushSettledAdvice(outcome);
+		});
+		runtime = builtRuntime;
 		activeModelLabel = `${model.provider}/${model.id}`;
 		builtForCwd = ctx.cwd;
 		dbg("built advisor runtime, model=", activeModelLabel);
@@ -1304,70 +1237,47 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- event wiring ----
 
-	// Capture the user prompt so it rides the next turn delta to the advisor.
+	// User preflight happens before Pi starts streaming, so mark the turn running
+	// here as well as at turn_start. This closes the only real pre-turn window without
+	// consulting isIdle() or maintaining a second terminal flag.
 	pi.on("before_agent_start", (event) => {
 		if (!enabled) return;
-		// The user is driving a new turn; clear any post-abort auto-resume suppression.
 		autoResumeSuppressed = false;
-		// The agent is now working, not stopped — drop any leftover terminal flag so a
-		// late nit from an earlier still-draining review can't wrongly claim the user
-		// already has a final answer. (Re-set accurately at this turn's turn_end.)
-		currentTurnTerminal = false;
-		// Also clear lastTurnWasTerminal HERE (but NOT on turn_start): before_agent_start
-		// fires in the user-turn preflight, before _runAgentPrompt makes the session
-		// stream, so isIdle() can still be true. Leaving lastTurnWasTerminal set would
-		// let a lagging nit arriving in that window claim parkedAtFinalAnswer and wrongly
-		// restate, even though the advice is being steered into the user's NEW turn, not
-		// a parked final answer. Advisory-triggered turns skip before_agent_start, so
-		// this doesn't undo the parked-agent fix (which relies on turn_start NOT clearing
-		// it). Re-set accurately at this turn's turn_end.
-		lastTurnWasTerminal = false;
+		turnState = "running";
 		pendingUserPrompt = event.prompt;
 	});
 
-	// before_agent_start fires ONLY for the user-message path (agent-session.ts
-	// emits it inside prompt()). A turn woken by our own steered advisory with
-	// triggerTurn goes straight through _runAgentPrompt and never emits it, so the
-	// reset above is skipped and currentTurnTerminal would stay stale-true across the
-	// advisory-triggered turn. turn_start fires for EVERY turn — the first turn of a
-	// triggerTurn-woken run AND same-run steered continuations after a terminal
-	// turn_end (e.g. held advice steered into a still-streaming agent) — so it is the
-	// complete reset point: once any turn begins, the agent is working again, not
-	// parked at a final answer. Ordering within a run is agent_start → turn_start →
-	// (work) → turn_end, so this reset always precedes the turn_end that re-derives
-	// the flag; no stale-true window survives. (pendingUserPrompt/autoResumeSuppressed
-	// stay tied to before_agent_start — those are genuinely user-turn-only.)
+	// Fires for every assistant turn, including advisory-triggered runs and same-run
+	// continuations. Every real turn_start is paired with turn_end (also on failure).
 	pi.on("turn_start", () => {
 		if (!enabled) return;
-		currentTurnTerminal = false;
+		turnState = "running";
 	});
 
 	// One delta per primary turn (assistant message + its tool results). After
 	// pushing, run the catch-up block: this hook is awaited by the agent loop, so
 	// awaiting here stalls the primary's next step until the advisor catches up.
 	pi.on("turn_end", async (event, ctx) => {
-		// Test seam: skip live model review (keeps the /advisor test delivery path) so
-		// nit delivery can be tested in the pi harness without the advisor model.
-		if (!enabled || process.env.ADVISOR_NO_REVIEW) return;
+		if (!enabled) return;
 
-		// Record terminality BEFORE any await: a nit from an EARLIER, still-draining
-		// review can fire its deliverAdvice callback during the ensureRuntime() await
-		// below, and it reads this flag — so it must already reflect the just-ended
-		// turn. Semantics: "the primary is now stopped, having returned a final answer"
-		// (set true on a terminal turn, false otherwise; cleared when the user drives a
-		// new turn). Used so advice that wakes the stopped agent appends the
-		// self-contained-final-answer guidance.
+		// This is the authoritative boundary: Pi has finalized the assistant message,
+		// and any steer observed during `running` will be inserted immediately after it.
+		// Set state before any await so concurrent advisor callbacks see the result.
 		const terminal = isTerminalTurn(event.message as any);
-		currentTurnTerminal = terminal;
-		// Survives turn_start (unlike currentTurnTerminal); lets a lagging review that
-		// delivers after the agent parks still see that the last turn was a final answer.
-		lastTurnWasTerminal = terminal;
-		// Live handle for primaryIdle() from lagging-review delivery callbacks.
-		lastCtx = ctx as any;
+		turnState = terminal ? "ended-terminal" : "ended-nonterminal";
+
+		// Test seam: skip live model review. The hidden command delivers directly when
+		// no runtime exists, so no queue work is needed here.
+		if (process.env.ADVISOR_NO_REVIEW) return;
 
 		const rt = await ensureRuntime(ctx as any);
-		dbg("turn_end", "terminal=", terminal, "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
+		dbg("turn_end", "state=", turnState, "enabled=", enabled, "runtime=", !!rt, "model=", activeModelLabel);
 		if (!rt) return;
+
+		// At a non-terminal boundary, queued nits preserve their low-latency behavior.
+		// At a terminal boundary they remain in the SAME queue and ride the final
+		// review's reconfirmation preamble alongside concerns/blockers.
+		if (!terminal) flushNits(rt);
 
 		const delta = formatTurnDelta({
 			userPrompt: pendingUserPrompt,
@@ -1482,16 +1392,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Hidden test hook: `/advisor test <nit|concern|blocker> <note>` drives the
-			// real deliverAdvice routing without depending on the advisor model's
-			// severity choice. Used by the RPC delivery tests.
+			// Hidden test hook. An idle nit delivers directly so it remains useful even
+			// before the runtime's first review; running/high-severity cases use the queue.
 			if (arg.startsWith("test")) {
 				const parsed = parseAdvisorTestArgs(args);
 				if (!parsed) {
 					ctx.ui.notify("usage: /advisor test <nit|concern|blocker> <note>", "warning");
 					return;
 				}
-				deliverAdvice(parsed.note, parsed.severity);
+				if (parsed.severity === "nit" && turnState !== "running")
+					sendNit(parsed.note, parsed.severity, turnState === "ended-terminal");
+				else deliverAdvice(parsed.note, parsed.severity);
 				return;
 			}
 
