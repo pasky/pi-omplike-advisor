@@ -183,6 +183,11 @@ test("decideNit: a lagging nit delivered to a parked agent restates even when cu
 	// but parkedAtFinalAnswer=true, so the inline nit must still restate: it IS a
 	// followup to the final answer.
 	assert.deepEqual(A.decideNit("nit", false, true, true), { stale: true, finalAnswer: true });
+	// the REAL lagging case: the advise callback fires while the advisor runtime is
+	// still busy (advisorIdle=false), currentTurnTerminal has raced false, agent
+	// parked: still delivered inline (not held, since the hold gate needs
+	// currentTurnTerminal) and restates via parkedAtFinalAnswer.
+	assert.deepEqual(A.decideNit("nit", false, false, true), { stale: true, finalAnswer: true });
 	// mid-run (not parked) stays no-restate even with the param present.
 	assert.deepEqual(A.decideNit("nit", false, false, false), { stale: true, finalAnswer: false });
 	// high severity is still held regardless of parked state.
@@ -1318,6 +1323,38 @@ test("lifecycle: a lagging nit delivered to a parked agent restates (currentTurn
 	assert.equal(sent.length, 1);
 	assert.match(sent[0].content, /self-contained final answer/, "a nit landing on a parked-at-final-answer agent must restate");
 	assert.match(sent[0].content, /context="raised about an earlier step"/, "it is still a lagging earlier-step nit");
+});
+
+// P2 race: before_agent_start fires in the user-turn preflight, before the session
+// starts streaming, so isIdle() is still true and lastTurnWasTerminal is still set
+// from the previous turn. A lagging nit arriving in that window must NOT restate:
+// it's a new user turn, not a parked final answer. Guards the before_agent_start reset.
+test("lifecycle: a nit during before_agent_start preflight does not restate (new user turn, not a parked answer)", async () => {
+	assert.ok(!process.env.ADVISOR_NO_REVIEW, "needs the real turn_end handler");
+	const sent = [];
+	let idle = true; // still idle during the user-turn preflight
+	const runtime = createExtensionRuntime();
+	runtime.sendMessage = (msg) => sent.push({ content: msg.content });
+	const res = await loadExtensions(["advisor.ts"], HERE, createEventBus(), runtime);
+	assert.deepEqual(res.errors, []);
+	const ext = res.extensions[0];
+	const h = (name) => {
+		const v = ext.handlers.get(name);
+		return Array.isArray(v) ? v[0] : v;
+	};
+	const cmd = ext.commands.get("advisor").handler;
+	const uiCtx = { ui: { notify: () => {} } };
+	const turnCtx = { model: undefined, cwd: HERE, isIdle: () => idle };
+	const terminalMsg = { message: { role: "assistant", content: [{ type: "text", text: "final answer" }] } };
+
+	// Terminal turn ends, agent parks.
+	await h("turn_end")(terminalMsg, turnCtx);
+	// User drives a new turn: before_agent_start fires while still idle (preflight).
+	h("before_agent_start")({ prompt: "next thing" }, turnCtx);
+	// A lagging nit fires in the preflight window.
+	await cmd("test nit preflight", uiCtx);
+	assert.equal(sent.length, 1);
+	assert.doesNotMatch(sent[0].content, /self-contained final answer/, "a preflight nit is steered into the new user turn, not a parked answer");
 });
 
 // ===========================================================================

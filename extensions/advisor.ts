@@ -305,9 +305,12 @@ export type NitDecision = "hold" | { stale: boolean; finalAnswer: boolean };
  * decision and the actual send.
  *
  * - concern/blocker → always held (reconfirmed against unraced state later).
- * - nit while the primary is parked at a terminal answer with a review still in
- *   flight → held, so it rides the terminal catch-up and is delivered with the
- *   restate directive rather than steering mid-review.
+ * - nit for the turn that is CURRENTLY ending as terminal, with a review still in
+ *   flight (`currentTurnTerminal && !advisorIdle`) → held, so it rides the terminal
+ *   catch-up and is delivered with the restate directive rather than steering
+ *   mid-review. (Note: this is distinct from `parkedAtFinalAnswer`, where the agent
+ *   has ALREADY gone idle — that case is delivered inline below, not held, since no
+ *   catch-up block is running to flush it.)
  * - otherwise deliver inline. Such a nit is always about an earlier/superseded
  *   step (a *current* nit from the terminal review is held by the branch above),
  *   hence `stale: true`; it carries the restate directive when it is a followup to
@@ -1310,6 +1313,15 @@ export default function (pi: ExtensionAPI) {
 		// late nit from an earlier still-draining review can't wrongly claim the user
 		// already has a final answer. (Re-set accurately at this turn's turn_end.)
 		currentTurnTerminal = false;
+		// Also clear lastTurnWasTerminal HERE (but NOT on turn_start): before_agent_start
+		// fires in the user-turn preflight, before _runAgentPrompt makes the session
+		// stream, so isIdle() can still be true. Leaving lastTurnWasTerminal set would
+		// let a lagging nit arriving in that window claim parkedAtFinalAnswer and wrongly
+		// restate, even though the advice is being steered into the user's NEW turn, not
+		// a parked final answer. Advisory-triggered turns skip before_agent_start, so
+		// this doesn't undo the parked-agent fix (which relies on turn_start NOT clearing
+		// it). Re-set accurately at this turn's turn_end.
+		lastTurnWasTerminal = false;
 		pendingUserPrompt = event.prompt;
 	});
 
