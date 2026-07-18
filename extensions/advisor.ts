@@ -168,6 +168,7 @@ export async function runTurnBlock(opts: {
 		// entries, so the shared queue is the confirmed survivor set.
 		const held = runtime.takeAllAdvice();
 		if (held.length) opts.deliverHeld(held, { terminal });
+		else if (terminal) opts.notify("advisor: caught up — nothing to add");
 		return 0;
 	}
 	// timeout OR failed (advisor errored 3x and dropped the reconfirm). Either way
@@ -228,12 +229,22 @@ export class AdviseTool {
 		"Send one concrete, ACTIONABLE piece of advice to the agent you are watching. Use sparingly; stay silent when nothing matters. Call it to head off likely-wrong or materially wasteful work. NEVER call it to report status, acknowledge, confirm, summarize, or signal that all is well / resolved / nothing-further-needed — in those cases emit nothing.";
 	readonly parameters = adviseSchema as any;
 	#delivered = new Map<string, number>();
+	// Held/queued notes intentionally stay out of #delivered so a later review can
+	// reconfirm them. Track them separately for the current agent.prompt() run so a
+	// model cannot spin forever by repeating the same advise call in one review.
+	#seenThisReview = new Map<string, number>();
 
 	// onAdvice returns true if delivered, false if queued or dropped.
 	constructor(private readonly onAdvice: (note: string, severity?: AdvisorSeverity) => boolean) {}
 
 	resetDelivered(): void {
 		this.#delivered.clear();
+		this.#seenThisReview.clear();
+	}
+
+	/** Start a fresh provider review attempt while preserving delivery dedup. */
+	beginReview(): void {
+		this.#seenThisReview.clear();
 	}
 
 	/**
@@ -250,13 +261,25 @@ export class AdviseTool {
 		const key = dedupeKey(args.note);
 		const rank = rankOf(args.severity);
 		const prev = this.#delivered.get(key) ?? 0;
-		if (rank <= prev) {
-			return { content: [{ type: "text", text: "Duplicate advice ignored." }], details: { ...args, dropped: true } };
+		const seen = this.#seenThisReview.get(key) ?? 0;
+		if (rank <= prev || rank <= seen) {
+			return {
+				content: [{ type: "text", text: "Duplicate advice ignored. End this review now." }],
+				details: { ...args, dropped: true },
+				terminate: true,
+			};
 		}
+		// Record before invoking the callback. Queued notes deliberately do not enter
+		// #delivered, but must still dedupe for the remainder of this review.
+		this.#seenThisReview.set(key, rank);
 		const delivered = this.onAdvice(args.note, args.severity);
 		if (!delivered) {
-			// Not recorded: it is queued for a boundary or dropped as stale.
-			return { content: [{ type: "text", text: "Queued for boundary delivery (or dropped as stale)." }], details: { ...args, held: true } };
+			// Not recorded across reviews: it is queued for a boundary or dropped as
+			// stale. beginReview() makes it eligible for a later reconfirmation.
+			return {
+				content: [{ type: "text", text: "Queued for boundary delivery. Do not call advise again for this item in this update." }],
+				details: { ...args, held: true },
+			};
 		}
 		this.#delivered.set(key, rank);
 		return { content: [{ type: "text", text: "Recorded." }], details: { ...args } };
@@ -775,6 +798,7 @@ export class AdvisorRuntime {
 					let last: AssistantMessage | undefined;
 					for (let attempt = 0; attempt < 2; attempt++) {
 						this.onDebug?.("prompting advisor agent, delta chars=", promptChars, "held=", offered.length);
+						this.adviseTool.beginReview();
 						await this.agent.prompt(messages);
 						if (this.#epoch !== epoch) {
 							stale = true;
@@ -1043,6 +1067,10 @@ export default function (pi: ExtensionAPI) {
 
 	// One source of truth for which primary boundary a queue flush belongs to.
 	let turnState: PrimaryTurnState = "ended-nonterminal";
+	// While a terminal runTurnBlock owns the successful-settle flush, keep the
+	// onSettled callback from draining the queue before the block can report whether
+	// it delivered advice or completed with nothing to add.
+	let terminalCatchUpPending = false;
 
 	// ---- statusbar: minimalistic per-session advisor cost ----
 	// Reflects the live advisor lifetime cost (rt.usage.cost) in the footer status
@@ -1145,11 +1173,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Reviews can finish after a primary turn_end timeout. Reuse the same boundary
-	// policy instead of creating a late-callback delivery path. This synchronous
-	// callback drains before a runTurnBlock waiter resumes; the latter then sees empty.
+	// policy instead of creating a late-callback delivery path. During an active
+	// terminal catch-up block, leave the synchronous settle flush to runTurnBlock so
+	// it can distinguish delivered advice from a clean "nothing to add" outcome.
 	function flushSettledAdvice(outcome: "ok" | "failed"): void {
 		if (outcome !== "ok" || !runtime || handoffInProgress()) return;
 		if (turnState === "ended-terminal") {
+			if (terminalCatchUpPending) return; // runTurnBlock owns this synchronous settle
 			const notes = runtime.takeAllAdvice();
 			if (notes.length) deliverHeld(notes, { terminal: true });
 		} else if (turnState === "ended-nonterminal") {
@@ -1167,6 +1197,7 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		turnState = "ended-nonterminal";
+		terminalCatchUpPending = false;
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
@@ -1179,6 +1210,7 @@ export default function (pi: ExtensionAPI) {
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		turnState = "ended-nonterminal";
+		terminalCatchUpPending = false;
 	}
 
 	// ---- build the advisor agent lazily (needs ctx for model/registry/cwd) ----
@@ -1290,20 +1322,25 @@ export default function (pi: ExtensionAPI) {
 		// Don't block during a handoff teardown (we'd stall the replacement).
 		if (handoffInProgress()) return;
 		updateStatus(ctx);
-		consecutiveBlocks = await runTurnBlock({
-			terminal,
-			runtime: rt,
-			consecutiveBlocks,
-			baseMs: BLOCK_BASE_MS,
-			capMs: BLOCK_CAP_MS,
-			signal: (ctx as any).signal,
-			notify: (m) => {
-				try {
-					(ctx as any).ui?.notify?.(m, "info");
-				} catch {}
-			},
-			deliverHeld,
-		});
+		terminalCatchUpPending = terminal;
+		try {
+			consecutiveBlocks = await runTurnBlock({
+				terminal,
+				runtime: rt,
+				consecutiveBlocks,
+				baseMs: BLOCK_BASE_MS,
+				capMs: BLOCK_CAP_MS,
+				signal: (ctx as any).signal,
+				notify: (m) => {
+					try {
+						(ctx as any).ui?.notify?.(m, "info");
+					} catch {}
+				},
+				deliverHeld,
+			});
+		} finally {
+			terminalCatchUpPending = false;
+		}
 		// If the user aborted (Escape) around the block, suppress auto-resume so a late
 		// advisor callback from the still-running review can't restart the stopped run.
 		if ((ctx as any).signal?.aborted) autoResumeSuppressed = true;
