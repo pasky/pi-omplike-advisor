@@ -1017,6 +1017,37 @@ function loadSystemPrompt(cwd: string): string {
 	return prompt;
 }
 
+/**
+ * Collects every user message delivered before an assistant turn. Pi emits
+ * `before_agent_start` only once per agent run, while queued steer/follow-up
+ * messages are inserted between turns in that same run. `message_end` is the
+ * shared lifecycle point for both the initial prompt and those queued messages.
+ */
+export class TurnUserPromptBuffer {
+	#messages: string[] = [];
+
+	capture(message: { role?: string; content?: unknown }): void {
+		if (message.role !== "user") return;
+		const content = message.content;
+		const text =
+			typeof content === "string"
+				? content
+				: Array.isArray(content)
+					? textOf(content as Array<{ type: string; text?: string }>)
+					: "";
+		if (text.trim()) this.#messages.push(text);
+	}
+
+	take(): string | undefined {
+		if (!this.#messages.length) return undefined;
+		return this.#messages.splice(0).join("\n\n");
+	}
+
+	reset(): void {
+		this.#messages = [];
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	let enabled = loadEnabled();
 
@@ -1025,8 +1056,8 @@ export default function (pi: ExtensionAPI) {
 	let activeModelLabel: string | undefined;
 	let builtForCwd: string | undefined;
 
-	// Delta accumulation across the lifecycle.
-	let pendingUserPrompt: string | undefined;
+	// User messages waiting to be paired with the assistant turn that saw them.
+	const pendingUserPrompts = new TurnUserPromptBuffer();
 
 	// The advise tool bound to the live runtime (held so the catch-up block can
 	// mark held notes delivered at the actual delivery point).
@@ -1163,7 +1194,7 @@ export default function (pi: ExtensionAPI) {
 		adviseTool = undefined;
 		activeModelLabel = undefined;
 		builtForCwd = undefined;
-		pendingUserPrompt = undefined;
+		pendingUserPrompts.reset();
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		turnState = "ended-nonterminal";
@@ -1175,7 +1206,7 @@ export default function (pi: ExtensionAPI) {
 	// paths can't drift.
 	function resetAdvisorState(): void {
 		runtime?.reset();
-		pendingUserPrompt = undefined;
+		pendingUserPrompts.reset();
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
 		turnState = "ended-nonterminal";
@@ -1240,11 +1271,21 @@ export default function (pi: ExtensionAPI) {
 	// User preflight happens before Pi starts streaming, so mark the turn running
 	// here as well as at turn_start. This closes the only real pre-turn window without
 	// consulting isIdle() or maintaining a second terminal flag.
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", () => {
 		if (!enabled) return;
+		// A new top-level run must not inherit a prompt from an interrupted run that
+		// never reached turn_end (for example, a failed manual compaction).
+		pendingUserPrompts.reset();
 		autoResumeSuppressed = false;
 		turnState = "running";
-		pendingUserPrompt = event.prompt;
+	});
+
+	// Capture the finalized user message rather than only before_agent_start's first
+	// prompt. Queued steer/follow-up messages emit message_end between turns without
+	// starting a new agent run, and this also preserves skill/template expansion.
+	pi.on("message_end", (event) => {
+		if (!enabled) return;
+		pendingUserPrompts.capture(event.message);
 	});
 
 	// Fires for every assistant turn, including advisory-triggered runs and same-run
@@ -1265,6 +1306,9 @@ export default function (pi: ExtensionAPI) {
 		// Set state before any await so concurrent advisor callbacks see the result.
 		const terminal = isTerminalTurn(event.message as any);
 		turnState = terminal ? "ended-terminal" : "ended-nonterminal";
+		// Drain synchronously at the boundary so messages cannot leak into a later turn
+		// when live review is disabled or no advisor model is currently available.
+		const userPrompt = pendingUserPrompts.take();
 
 		// Test seam: skip live model review. The hidden command delivers directly when
 		// no runtime exists, so no queue work is needed here.
@@ -1280,11 +1324,10 @@ export default function (pi: ExtensionAPI) {
 		if (!terminal) flushNits(rt);
 
 		const delta = formatTurnDelta({
-			userPrompt: pendingUserPrompt,
+			userPrompt,
 			assistant: event.message as AssistantMessage,
 			toolResults: event.toolResults as ToolResultMessage[],
 		});
-		pendingUserPrompt = undefined;
 		rt.push(delta);
 
 		// Don't block during a handoff teardown (we'd stall the replacement).
@@ -1314,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
 	// Re-prime the advisor when the primary transcript is rewritten.
 	pi.on("session_compact", (_event, ctx) => {
 		runtime?.reset();
+		pendingUserPrompts.reset();
 		updateStatus(ctx);
 	});
 	pi.on("session_start", (event, ctx) => {

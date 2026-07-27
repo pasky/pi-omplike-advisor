@@ -1400,6 +1400,25 @@ test("runtime queue: re-raising advice at higher severity escalates it", () => {
 	assert.equal(rt.takeAllAdvice()[0].severity, "blocker");
 });
 
+test("TurnUserPromptBuffer: captures initial and queued user messages per turn", () => {
+	const pending = new A.TurnUserPromptBuffer();
+	pending.capture({ role: "user", content: "initial request" });
+	pending.capture({ role: "assistant", content: [{ type: "text", text: "ignored" }] });
+	assert.equal(pending.take(), "initial request");
+	assert.equal(pending.take(), undefined, "a prompt is drained exactly once");
+
+	// Steer and follow-up messages can both arrive between turns without another
+	// before_agent_start. Preserve every delivered message for the next delta.
+	pending.capture({ role: "user", content: [{ type: "text", text: "steered correction" }] });
+	pending.capture({ role: "user", content: [{ type: "text", text: "queued follow-up" }] });
+	assert.equal(pending.take(), "steered correction\n\nqueued follow-up");
+
+	pending.capture({ role: "user", content: [{ type: "image", data: "..." }] });
+	pending.capture({ role: "user", content: "discard on reset" });
+	pending.reset();
+	assert.equal(pending.take(), undefined);
+});
+
 // ===========================================================================
 // 2. real loader
 // ===========================================================================
@@ -1411,13 +1430,14 @@ async function loadAdvisorExtension() {
 	return res.extensions[0];
 }
 
-test("extension loads + registers /advisor command and advisory renderer", async () => {
+test("extension loads + registers lifecycle hooks, command, and renderer", async () => {
 	const ext = await loadAdvisorExtension();
+	assert.ok(ext.handlers.has("message_end"), "registers queued-user-message capture");
 	assert.ok(ext.commands.has("advisor"), "registers /advisor");
 	assert.ok(ext.messageRenderers.has("advisory"), "registers advisory renderer");
 });
 
-test("agent-core ordering: a steer queued during streaming is inserted after that assistant turn_end", async () => {
+test("agent-core ordering: queued advisory and user messages land at turn boundaries", async () => {
 	const responders = [];
 	const streamFn = () => {
 		const stream = new EventStream(
@@ -1444,10 +1464,19 @@ test("agent-core ordering: a steer queued during streaming is inserted after tha
 	};
 	const agent = new CoreAgent({ streamFn });
 	const order = [];
+	const pendingUserPrompts = new A.TurnUserPromptBuffer();
+	const reviewedUserPrompts = [];
 	agent.subscribe((event) => {
-		if (event.type === "turn_start" || event.type === "turn_end") order.push(event.type);
-		if (event.type === "message_end" && event.message.role === "assistant") order.push(`assistant:${event.message.content[0]?.text}`);
-		if (event.type === "message_end" && event.message.role === "custom") order.push("custom:advice");
+		if (event.type === "turn_start") order.push(event.type);
+		if (event.type === "message_end") {
+			pendingUserPrompts.capture(event.message);
+			if (event.message.role === "assistant") order.push(`assistant:${event.message.content[0]?.text}`);
+			if (event.message.role === "custom") order.push("custom:advice");
+		}
+		if (event.type === "turn_end") {
+			order.push(event.type);
+			reviewedUserPrompts.push(pendingUserPrompts.take());
+		}
 	});
 	const waitForResponders = async (count) => {
 		while (responders.length < count) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1456,15 +1485,22 @@ test("agent-core ordering: a steer queued during streaming is inserted after tha
 	const run = agent.prompt("work");
 	await waitForResponders(1);
 	agent.steer({ role: "custom", customType: "advisory", content: "nit", display: true, timestamp: Date.now() });
+	agent.steer({ role: "user", content: [{ type: "text", text: "steered correction" }], timestamp: Date.now() });
+	agent.followUp({ role: "user", content: [{ type: "text", text: "queued follow-up" }], timestamp: Date.now() });
 	responders[0]("final answer");
 	await waitForResponders(2);
-	responders[1]("revised answer");
+	responders[1]("revised for advice");
+	await waitForResponders(3);
+	responders[2]("corrected answer");
+	await waitForResponders(4);
+	responders[3]("follow-up answer");
 	await run;
 
 	const finalMessage = order.indexOf("assistant:final answer");
 	const finalTurnEnd = order.indexOf("turn_end", finalMessage);
 	const advice = order.indexOf("custom:advice");
 	assert.ok(finalMessage >= 0 && finalTurnEnd > finalMessage && advice > finalTurnEnd, `unexpected order: ${order.join(" → ")}`);
+	assert.deepEqual(reviewedUserPrompts, ["work", undefined, "steered correction", "queued follow-up"]);
 });
 
 // Drive real extension handlers for the hidden no-model command seam. Production
