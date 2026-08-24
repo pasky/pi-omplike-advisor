@@ -1002,13 +1002,29 @@ You MAY suggest an approach or fix if you've explored enough to be confident.
 Offer the better design, not just the warning.
 `;
 
-function loadSystemPrompt(cwd: string): string {
+// Appended when the advisor model has no image input: the transcript it receives is
+// text-only, so screenshots/diagrams the main agent (or the user) can actually SEE are
+// invisible to it. Without this it tends to "advise" about missing visual evidence.
+const NO_VISION_NOTE = `
+
+<vision>
+You are a TEXT-ONLY model: images (screenshots, diagrams, photos, rendered output) in
+the transcript are NOT visible to you — but the main agent CAN see them, and so can the
+user. Never assume an image is missing, unreadable, or unverified just because you can't
+see it, never ask for it to be described, and never doubt or contradict the agent's
+reading of an image — on anything that hinges on image content, the agent has evidence
+you lack. Stay SILENT there and confine your advice to what the text shows.
+</vision>`;
+
+function loadSystemPrompt(cwd: string, model?: { input?: string[] }): string {
 	let prompt = "";
 	try {
 		prompt = fs.readFileSync(path.join(agentDir(), "system-prompts", "advisor.md"), "utf8");
 	} catch {
 		prompt = DEFAULT_ADVISOR_SYSTEM_PROMPT;
 	}
+	// `input` is the model's modality list from models-store.json, e.g. ["text","image"].
+	if (model && !(Array.isArray(model.input) && model.input.includes("image"))) prompt += NO_VISION_NOTE;
 	// Append WATCHDOG.md (advisor-only project guidance) if present in cwd.
 	try {
 		const wd = fs.readFileSync(path.join(cwd, "WATCHDOG.md"), "utf8").trim();
@@ -1217,7 +1233,7 @@ export default function (pi: ExtensionAPI) {
 			cwd: ctx.cwd,
 			model,
 			thinkingLevel,
-			systemPrompt: loadSystemPrompt(ctx.cwd),
+			systemPrompt: loadSystemPrompt(ctx.cwd, model),
 			modelRegistry: ctx.modelRegistry,
 			adviseTool: builtAdviseTool,
 		});
