@@ -496,6 +496,7 @@ export class AdvisorRuntime {
 	#reviewEpoch = -1;
 	#settleWaiters: Array<{ settle: () => void; cancel: () => void }> = [];
 	#busy = false;
+	#resetPending = false;
 	#backlog = 0;
 	#failures = 0;
 	#epoch = 0;
@@ -684,8 +685,21 @@ export class AdvisorRuntime {
 		void this.#drain();
 	}
 
+	// Called only when no owned prompt is running. abort() requests cancellation;
+	// it does not make Agent.reset() safe until the prompt has actually settled.
+	#resetAgent(): void {
+		this.#resetPending = false;
+		try {
+			this.agent.reset();
+		} catch (error) {
+			this.onDebug?.("advisor agent reset failed", String(error));
+			this.dispose();
+		}
+	}
+
 	/** Re-prime after a history rewrite (compaction / session switch / fork). */
 	reset(): void {
+		if (this.disposed) return;
 		this.#epoch++;
 		this.#pending = [];
 		this.#advice = [];
@@ -696,17 +710,19 @@ export class AdvisorRuntime {
 		// Full reset = fresh accounting (unlike #softReset, which preserves these).
 		this.#cumInput = this.#cumOutput = this.#cumCost = 0;
 		this.adviseTool.resetDelivered();
+		this.#resetPending = true;
 		try {
 			this.agent.abort();
 		} catch {}
-		try {
-			this.agent.reset();
-		} catch {}
+		// Fence stale callbacks and cancel waiters now, but let the serialized
+		// drain clear history before consuming any post-reset deltas.
+		if (!this.#busy) this.#resetAgent();
 		this.#cancelWaiters();
 	}
 
 	dispose(): void {
 		this.disposed = true;
+		this.#resetPending = false;
 		this.#epoch++;
 		this.#pending = [];
 		this.#advice = [];
@@ -723,7 +739,9 @@ export class AdvisorRuntime {
 		if (this.#busy) return;
 		this.#busy = true;
 		try {
-			while (!this.disposed && this.#pending.length) {
+			while (!this.disposed && (this.#resetPending || this.#pending.length)) {
+				if (this.#resetPending) this.#resetAgent();
+				if (this.disposed || !this.#pending.length) break;
 				const batch = this.#pending.splice(0);
 				const turns = batch.length;
 				// Rough gauge of how many turns are still unreviewed (status display only).
@@ -1203,7 +1221,7 @@ export default function (pi: ExtensionAPI) {
 		modelRegistry: any;
 		model: any;
 	}): Promise<AdvisorRuntime | undefined> {
-		if (runtime && builtForCwd === ctx.cwd) return runtime;
+		if (runtime && !runtime.disposed && builtForCwd === ctx.cwd) return runtime;
 		if (runtime && builtForCwd !== ctx.cwd) teardown();
 
 		if (!ctx.model) return undefined;
