@@ -1,2 +1,7 @@
 node_modules/
 *.log
+.gitignore
+README.LJ
+*~
+.*.s[wv]?
+.viminfo

@@ -70,14 +70,19 @@ packages.)
 - `/advisor on` — enable the advisor (persisted; it is on by default unless
   explicitly turned off).
 - `/advisor off` — disable the advisor (persisted).
+- `/advisor model` — open pi's model selector (the same component `/model`
+  uses) to choose the advisor model. `Enter` applies for the current session
+  only; `Ctrl+S` saves it to `modes.json` as the default, exactly like `/model`.
+  Non-interactive form: `/advisor model <provider/model>` saves directly.
 
 ## Configuration
 
 ### Advisor model
 
-The advisor model defaults to **`openrouter/z-ai/glm-5.2`**. Override it by
-adding an `advisor` entry to `modes.json` (project `.pi/modes.json` or global
-`~/.pi/agent/modes.json`):
+The advisor model defaults to **`openrouter/z-ai/glm-5.2`**. Override it with
+`/advisor model` (interactive, reuses pi's `/model` selector; `Ctrl+S` persists)
+or by adding an `advisor` entry to `modes.json` (project `.pi/modes.json` or
+global `~/.pi/agent/modes.json`):
 
 ```json
 {

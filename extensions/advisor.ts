@@ -4,7 +4,8 @@
  * upstream pi's extension API.
  *
  * Enable with `/advisor on` (persisted). The advisor model defaults to
- * openrouter/z-ai/glm-5.2 (override via an "advisor" entry in modes.json).
+ * openrouter/z-ai/glm-5.2 (override via an "advisor" entry in modes.json, or
+ * interactively with `/advisor model`, which reuses pi's own model selector).
  *
  * Delivery model. Nothing here is a hard interrupt: upstream pi's extension
  * surface delivers via `steer` (the message folds in at the agent's next step
@@ -40,7 +41,7 @@ import * as path from "node:path";
 import { Agent, type AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { convertToLlm, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
+import { ModelSelectorComponent, convertToLlm, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -895,6 +896,38 @@ function saveEnabled(enabled: boolean): void {
 	} catch {}
 }
 
+// ---- advisor model config (modes.json) ----
+
+/**
+ * The modes.json file that currently decides the advisor model: the project
+ * file when it defines an `advisor` entry, else the global one (matches
+ * loadModeSpec's project-first lookup). New defaults are written to whichever
+ * file is in effect, so a `/advisor model` change always takes.
+ */
+function advisorModesPath(cwd: string): string {
+	for (const p of [path.join(cwd, ".pi", "modes.json"), path.join(agentDir(), "modes.json")]) {
+		try {
+			if (JSON.parse(fs.readFileSync(p, "utf8"))?.modes?.advisor) return p;
+		} catch {}
+	}
+	return path.join(agentDir(), "modes.json");
+}
+
+/** Persist the advisor model into modes.json, preserving every other field. */
+function saveAdvisorModel(cwd: string, provider: string, modelId: string): string {
+	const file = advisorModesPath(cwd);
+	let parsed: any = {};
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {}
+	if (!parsed || typeof parsed !== "object") parsed = {};
+	if (!parsed.modes || typeof parsed.modes !== "object") parsed.modes = {};
+	parsed.modes.advisor = { ...(parsed.modes.advisor ?? {}), provider, modelId };
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+	return file;
+}
+
 // Default advisor system prompt, bundled so the package is self-contained. A
 // user-provided ~/.pi/agent/system-prompts/advisor.md overrides it when present.
 const DEFAULT_ADVISOR_SYSTEM_PROMPT = `You bring a different angle, and advocate for the user and for code-quality & robustness.
@@ -1003,6 +1036,9 @@ export default function (pi: ExtensionAPI) {
 	let runtime: AdvisorRuntime | undefined;
 	let activeModelLabel: string | undefined;
 	let builtForCwd: string | undefined;
+	// Session-only advisor model override set by `/advisor model` (Enter), mirroring
+	// `/model`. Cleared when saved to config (Ctrl+S) or on teardown.
+	let sessionAdvisorModel: Model<any> | undefined;
 
 	// Delta accumulation across the lifecycle.
 	let pendingUserPrompt: string | undefined;
@@ -1052,6 +1088,27 @@ export default function (pi: ExtensionAPI) {
 		}
 		const bar = ui.theme ? ui.theme.fg("dim", "│") : "│";
 		ui.setStatus(STATUS_KEY, `${bar} Advisor: $${runtime.usage.cost.toFixed(2)}`);
+	}
+
+	// The advisor model that would be used right now (for the picker's ✓ marker).
+	async function resolveAdvisorCurrentModel(ctx: any): Promise<any> {
+		try {
+			const spec = await loadModeSpec(ctx.cwd, "advisor");
+			if (spec?.provider && spec.modelId) {
+				const m = ctx.modelRegistry.find(spec.provider, spec.modelId);
+				if (m) return m;
+			}
+		} catch {}
+		return ctx.modelRegistry.find(DEFAULT_ADVISOR_PROVIDER, DEFAULT_ADVISOR_MODEL);
+	}
+
+	// The persistently configured advisor model (modes.json) — badged "default".
+	async function configuredAdvisorRef(cwd: string): Promise<{ provider: string; id: string } | undefined> {
+		try {
+			const spec = await loadModeSpec(cwd, "advisor");
+			if (spec?.provider && spec.modelId) return { provider: spec.provider, id: spec.modelId };
+		} catch {}
+		return undefined;
 	}
 
 	// ---- advice delivery into the primary session ----
@@ -1114,12 +1171,19 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function teardown(): void {
+	// Drop the built advisor runtime so the next turn rebuilds it (used after a
+	// live model change). Keeps sessionAdvisorModel + enabled state intact.
+	function rebuildRuntime(): void {
 		runtime?.dispose();
 		runtime = undefined;
 		adviseTool = undefined;
 		activeModelLabel = undefined;
 		builtForCwd = undefined;
+	}
+
+	function teardown(): void {
+		rebuildRuntime();
+		sessionAdvisorModel = undefined;
 		pendingUserPrompt = undefined;
 		consecutiveBlocks = 0;
 		autoResumeSuppressed = false;
@@ -1149,8 +1213,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (!ctx.model) return undefined;
 
-		// Resolve advisor model: modes.json "advisor" first, else the default.
-		let model: any;
+		// Resolve advisor model: session override → modes.json "advisor" → bundled default.
+		let model: any = sessionAdvisorModel;
 		let thinkingLevel = DEFAULT_THINKING;
 		try {
 			const spec = await loadModeSpec(ctx.cwd, "advisor");
@@ -1159,7 +1223,7 @@ export default function (pi: ExtensionAPI) {
 				const resolved = await resolveModelAndThinking(ctx.cwd, ctx.modelRegistry, ctx.model, DEFAULT_THINKING, {
 					mode: "advisor",
 				});
-				model = resolved.model;
+				if (!model) model = resolved.model;
 				thinkingLevel = resolved.thinkingLevel || DEFAULT_THINKING;
 			}
 		} catch {}
@@ -1292,7 +1356,8 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- /advisor command ----
 	pi.registerCommand("advisor", {
-		description: "Toggle/inspect the advisor (a second model that reviews each turn). Usage: /advisor [on|off|status]",
+		description:
+			"Toggle/inspect the advisor (a second model that reviews each turn). Usage: /advisor [on|off|status|model]",
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 
@@ -1336,6 +1401,69 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// `/advisor model` — pick the advisor model with pi's own model selector
+			// (the same component `/model` uses). Enter applies for this session only;
+			// Ctrl+S persists it to modes.json, exactly like `/model`.
+			if (arg === "model" || arg.startsWith("model ")) {
+				// Direct form (works in any mode): /advisor model provider/id
+				const target = args.trim().slice("model".length).trim();
+				if (target) {
+					const slash = target.indexOf("/");
+					const picked =
+						slash > 0 ? ctx.modelRegistry.find(target.slice(0, slash), target.slice(slash + 1)) : undefined;
+					if (!picked) {
+						ctx.ui.notify(`advisor: unknown model "${target}" — use provider/model`, "warning");
+						return;
+					}
+					const file = saveAdvisorModel(ctx.cwd, picked.provider, picked.id);
+					sessionAdvisorModel = undefined;
+					rebuildRuntime();
+					updateStatus(ctx);
+					ctx.ui.notify(`advisor model saved → ${picked.provider}/${picked.id} (${file})`, "info");
+					return;
+				}
+
+				// Interactive form: reuse pi's model selector via ctx.ui.custom.
+				if (ctx.mode !== "tui" || !ctx.hasUI) {
+					ctx.ui.notify("advisor: the model picker needs the interactive UI; use /advisor model <provider/model>", "warning");
+					return;
+				}
+				const modelRuntime = (ctx.modelRegistry as any).runtime;
+				if (!modelRuntime) {
+					ctx.ui.notify("advisor: model runtime unavailable", "warning");
+					return;
+				}
+				const current = sessionAdvisorModel ?? (await resolveAdvisorCurrentModel(ctx));
+				const configured = await configuredAdvisorRef(ctx.cwd);
+				await ctx.ui.custom((tui, _theme, _kb, done) => {
+					return new ModelSelectorComponent(
+						tui,
+						current,
+						modelRuntime,
+						ctx.scopedModels as any,
+						(model: any) => {
+							sessionAdvisorModel = model;
+							rebuildRuntime();
+							updateStatus(ctx);
+							done(undefined);
+							ctx.ui.notify(`advisor model (session) → ${model.provider}/${model.id}`, "info");
+						},
+						() => done(undefined),
+						undefined,
+						(model: any) => {
+							const file = saveAdvisorModel(ctx.cwd, model.provider, model.id);
+							sessionAdvisorModel = undefined;
+							rebuildRuntime();
+							updateStatus(ctx);
+							done(undefined);
+							ctx.ui.notify(`advisor model saved → ${model.provider}/${model.id} (${file})`, "info");
+						},
+						configured,
+					);
+				});
+				return;
+			}
+
 			// Hidden test hook: `/advisor test <nit|concern|blocker> <note>` drives the
 			// real deliverAdvice routing without depending on the advisor model's
 			// severity choice. Used by the RPC delivery tests.
@@ -1349,7 +1477,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify("usage: /advisor [on|off|status]", "warning");
+			ctx.ui.notify("usage: /advisor [on|off|status|model]", "warning");
 		},
 	});
 }
