@@ -885,10 +885,6 @@ function handoffInProgress(): boolean {
 	return !!(globalThis as any)[HANDOFF_IN_PROGRESS_KEY];
 }
 
-// Emitted by the handoff extension after its tool path replaces the session
-// transcript via the low-level sessionManager.newSession() (which emits no
-// session_start). Must match HANDOFF_SESSION_REPLACED_CHANNEL in handoff.ts.
-const HANDOFF_SESSION_REPLACED_CHANNEL = "pi-amplike:handoff-session-replaced";
 const DEFAULT_ADVISOR_PROVIDER = "openrouter";
 const DEFAULT_ADVISOR_MODEL = "z-ai/glm-5.2";
 const DEFAULT_THINKING = "low";
@@ -1186,9 +1182,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Re-prime for a replaced transcript without tearing down the advisor agent:
-	// clear its context so the next delta replays fresh. Used by both the
-	// session_start handler and the handoff session-replaced signal so the two
-	// paths can't drift.
+	// clear its context so the next delta replays fresh.
 	function resetAdvisorState(): void {
 		runtime?.reset();
 		pendingUserPrompt = undefined;
@@ -1339,10 +1333,6 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 		}
 	});
-
-	// Tool-path handoff replaces the transcript without a session_start event
-	// (low-level sessionManager.newSession()), so reset off this explicit signal.
-	pi.events.on(HANDOFF_SESSION_REPLACED_CHANNEL, () => resetAdvisorState());
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		teardown();
