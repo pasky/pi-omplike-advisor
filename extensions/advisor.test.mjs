@@ -23,6 +23,7 @@
  */
 
 import assert from "node:assert/strict";
+import { registerAdvisorResetTests } from "./advisor-reset-tests.mjs";
 import { spawn, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -73,6 +74,7 @@ initTheme();
 let passed = 0;
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
+registerAdvisorResetTests(test, { ...A, CoreAgent, EventStream });
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 // ===========================================================================
