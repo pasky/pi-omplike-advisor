@@ -413,32 +413,41 @@ test("AdviseTool: records, dedups, and escalates by severity rank", async () => 
 	assert.equal(calls.length, 3);
 });
 
-test("AdviseTool: held notes (onAdvice→false) stay unrecorded so they can re-fire", async () => {
-	let deliver = false; // simulate "held" first, then "delivered"
+test("AdviseTool: queued notes dedupe within one review but can re-fire in a later review", async () => {
+	let deliver = false; // simulate "queued" first, then "delivered"
 	const calls = [];
 	const tool = new A.AdviseTool((note, severity) => {
 		calls.push({ note, severity });
 		return deliver;
 	});
 
-	// first attempt held → tool reports held, dedup NOT recorded
+	// First attempt queues the note but does not record it as delivered.
 	const r1 = await tool.execute("h1", { note: "data race", severity: "blocker" });
 	assert.match(r1.content[0].text, /Queued for boundary/);
 	assert.equal(r1.details.held, true);
 	assert.equal(calls.length, 1);
 
-	// same note re-raised while still held → onAdvice fires AGAIN (not deduped away)
-	await tool.execute("h2", { note: "data race", severity: "blocker" });
+	// A non-compliant model repeating it in the SAME agent.prompt() is stopped.
+	const duplicate = await tool.execute("h2", { note: "data race", severity: "blocker" });
+	assert.match(duplicate.content[0].text, /Duplicate/);
+	assert.equal(duplicate.terminate, true);
+	assert.equal(calls.length, 1, "same-review duplicate must not enqueue again");
+
+	// A later review may legitimately reconfirm the queued note.
+	tool.beginReview();
+	await tool.execute("h3", { note: "data race", severity: "blocker" });
 	assert.equal(calls.length, 2);
 
-	// now it gets delivered → recorded
+	// Once boundary delivery succeeds, normal cross-review dedup takes over.
+	tool.beginReview();
 	deliver = true;
-	const r3 = await tool.execute("h3", { note: "data race", severity: "blocker" });
-	assert.match(r3.content[0].text, /Recorded/);
+	const r4 = await tool.execute("h4", { note: "data race", severity: "blocker" });
+	assert.match(r4.content[0].text, /Recorded/);
 	assert.equal(calls.length, 3);
 
-	// once delivered, a same-severity repeat is deduped away
-	await tool.execute("h4", { note: "data race", severity: "blocker" });
+	tool.beginReview();
+	const deliveredDuplicate = await tool.execute("h5", { note: "data race", severity: "blocker" });
+	assert.equal(deliveredDuplicate.terminate, true);
 	assert.equal(calls.length, 3);
 });
 
@@ -527,11 +536,24 @@ test("runTurnBlock: non-terminal + held + timeout → keeps held, doubles streak
 	assert.equal(rt.hasHighPriority, true, "held notes are kept, not taken");
 });
 
-test("runTurnBlock: terminal blocks unconditionally (even with nothing held)", async () => {
+test("runTurnBlock: terminal blocks unconditionally and replaces catch-up notice when there is no advice", async () => {
 	const rt = stubRuntime({ held: [], settleResult: "settled" });
-	const n = await A.runTurnBlock(blockArgs({ terminal: true, runtime: rt }));
+	const notices = [];
+	const n = await A.runTurnBlock(blockArgs({ terminal: true, runtime: rt, notify: (message) => notices.push(message) }));
 	assert.equal(rt.waited, true, "terminal must block until the advisor settles");
 	assert.equal(n, 0);
+	assert.deepEqual(notices, ["advisor: catching up before the turn ends…", "advisor: caught up — nothing to add"]);
+});
+
+test("runTurnBlock: successful terminal advice does not report nothing to add", async () => {
+	const rt = stubRuntime({ held: [{ note: "unsafe delete", severity: "blocker" }], settleResult: "settled" });
+	const notices = [];
+	const delivered = [];
+	await A.runTurnBlock(
+		blockArgs({ terminal: true, runtime: rt, notify: (message) => notices.push(message), deliverHeld: (notes) => delivered.push(...notes) }),
+	);
+	assert.deepEqual(delivered, [{ note: "unsafe delete", severity: "blocker" }]);
+	assert.deepEqual(notices, ["advisor: catching up before the turn ends…"]);
 });
 
 test("runTurnBlock: terminal timeout → delivers held best-effort (current, not stale)", async () => {
@@ -1024,6 +1046,37 @@ test("integration (regression): terminal timeout delivers a held note stuck mid-
 	assert.equal(h.delivered[0].severity, "blocker");
 	assert.equal(cb, 0);
 	releaseReview2?.(); // let the hung review finish for a clean exit
+});
+
+test("runtime: each agent.prompt starts fresh same-review advice dedup", async () => {
+	let reviews = 0;
+	let callbacks = 0;
+	const tool = new A.AdviseTool(() => {
+		callbacks++;
+		return false;
+	});
+	const agent = {
+		state: { messages: [], model: {} },
+		async prompt() {
+			reviews++;
+			const first = await tool.execute(`first-${reviews}`, { note: "repeat me", severity: "blocker" });
+			assert.match(first.content[0].text, /Queued for boundary/);
+			const duplicate = await tool.execute(`duplicate-${reviews}`, { note: "repeat me", severity: "blocker" });
+			assert.equal(duplicate.terminate, true, "same-review duplicate terminates the tool loop");
+			this.state.messages.push({ role: "assistant", content: [], usage: {}, stopReason: "stop" });
+		},
+		abort() {},
+		reset() {},
+	};
+	const rt = new A.AdvisorRuntime(agent, tool, 0);
+
+	rt.push("turn 1");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+	rt.push("turn 2");
+	assert.equal(await rt.waitUntilSettled(2000), "settled");
+
+	assert.equal(reviews, 2);
+	assert.equal(callbacks, 2, "the first call is accepted once in each distinct review");
 });
 
 test("runtime.waitUntilSettled: settles on drain, times out, and aborts", async () => {
