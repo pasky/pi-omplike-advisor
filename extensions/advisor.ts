@@ -1252,8 +1252,13 @@ export default function (pi: ExtensionAPI) {
 	// consulting isIdle() or maintaining a second terminal flag.
 	pi.on("before_agent_start", (event) => {
 		if (!enabled) return;
-		autoResumeSuppressed = false;
 		turnState = "running";
+		// pi >=1.2 also fires this for runs an extension starts with a message
+		// (messageType "custom": /review results, side-agent notifications), which
+		// carry no prompt. Only a user prompt is the user's next turn; older pi
+		// fires it for user prompts only and sets no messageType.
+		if ((event as { messageType?: string }).messageType === "custom") return;
+		autoResumeSuppressed = false;
 		pendingUserPrompt = event.prompt;
 	});
 
